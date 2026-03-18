@@ -196,5 +196,40 @@
     "tipo_usuario": "Recurrente",
     "tiempo_promedio_pagina": 0,
     "fuente_trafico": "Directo"
+  },
+  {
+    "ip": "155.117.189.94",
+    "pais": "United States",
+    "fecha_hora_entrada": "2026-03-18 02:52:05",
+    "origen": "https://casa-fresca.onrender.com/",
+    "afiliado": "Ninguno",
+    "duracion_sesion_segundos": 0,
+    "tiempo_carga_pagina_ms": 0,
+    "nombre_comprador": "H Alejandro Martinez tet",
+    "telefono_comprador": "+53 54057298",
+    "nombre_persona_entrega": "nombre test",
+    "telefono_persona_entrega": "numero test",
+    "correo_comprador": "alederibia@gmail.com",
+    "direccion_envio": "Cuba",
+    "compras": [
+      {
+        "id": "prod_001",
+        "name": "Aceite de Oliva «Alma» (1 litro)",
+        "quantity": 1,
+        "unitPrice": 13.2
+      },
+      {
+        "id": "prod_003",
+        "name": "Frijol Negro (500g)",
+        "quantity": 1,
+        "unitPrice": 1.73
+      }
+    ],
+    "precio_compra_total": "14.93",
+    "navegador": "Chrome",
+    "sistema_operativo": "Windows",
+    "tipo_usuario": "Único",
+    "tiempo_promedio_pagina": 0,
+    "fuente_trafico": "Directo"
   }
 ]
