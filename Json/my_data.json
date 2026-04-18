@@ -27,5 +27,116 @@
     "tipo_usuario": "Recurrente",
     "tiempo_promedio_pagina": 0,
     "fuente_trafico": "https://www.google.com/"
+  },
+  {
+    "ip": "212.102.51.33",
+    "pais": "Japan",
+    "fecha_hora_entrada": "2026-03-21 19:43:35",
+    "origen": "https://localhost/#/",
+    "afiliado": "Ninguno",
+    "duracion_sesion_segundos": 0,
+    "tiempo_carga_pagina_ms": 0,
+    "nombre_comprador": "Test",
+    "telefono_comprador": "123456",
+    "nombre_persona_entrega": "Kdkcmx",
+    "telefono_persona_entrega": "466768684",
+    "correo_comprador": "test@re.com",
+    "direccion_envio": "Snnzndns",
+    "compras": [
+      {
+        "id": "prod_001",
+        "name": "Aceite de Oliva «Alma» (1 litro)",
+        "quantity": 1,
+        "unitPrice": 13.2
+      },
+      {
+        "id": "prod_002",
+        "name": "Pack x 12 Néctar de Pera (12x330ml)",
+        "quantity": 1,
+        "unitPrice": 13.698
+      },
+      {
+        "id": "prod_003",
+        "name": "Frijol Negro (500g)",
+        "quantity": 1,
+        "unitPrice": 1.73
+      }
+    ],
+    "precio_compra_total": "28.63",
+    "navegador": "Chrome",
+    "sistema_operativo": "Linux",
+    "tipo_usuario": "Único",
+    "tiempo_promedio_pagina": 0,
+    "fuente_trafico": "Directo"
+  },
+  {
+    "ip": "2a02:6ea0:e00a:2239::11",
+    "pais": "United States",
+    "fecha_hora_entrada": "2026-03-31 10:17:54",
+    "origen": "https://localhost/#/",
+    "afiliado": "Ninguno",
+    "duracion_sesion_segundos": 0,
+    "tiempo_carga_pagina_ms": 0,
+    "nombre_comprador": "Test",
+    "telefono_comprador": "123456",
+    "nombre_persona_entrega": "Jdjdjd",
+    "telefono_persona_entrega": "8844",
+    "correo_comprador": "test@re.com",
+    "direccion_envio": "Jsjdjd",
+    "compras": [
+      {
+        "id": "prod_001",
+        "name": "Aceite de Oliva «Alma» (1 litro)",
+        "quantity": 1,
+        "unitPrice": 13.2
+      },
+      {
+        "id": "prod_002",
+        "name": "Pack x 12 Néctar de Pera (12x330ml)",
+        "quantity": 1,
+        "unitPrice": 13.698
+      }
+    ],
+    "precio_compra_total": "26.90",
+    "navegador": "Chrome",
+    "sistema_operativo": "Linux",
+    "tipo_usuario": "Recurrente",
+    "tiempo_promedio_pagina": 0,
+    "fuente_trafico": "Directo"
+  },
+  {
+    "ip": "2a02:6ea0:de10:3564::11",
+    "pais": "Canada",
+    "fecha_hora_entrada": "2026-04-18 02:22:51",
+    "origen": "https://localhost/#/",
+    "afiliado": "Ninguno",
+    "duracion_sesion_segundos": 0,
+    "tiempo_carga_pagina_ms": 0,
+    "nombre_comprador": "Test",
+    "telefono_comprador": "123456",
+    "nombre_persona_entrega": "Si.svmdvm",
+    "telefono_persona_entrega": "949545#49",
+    "correo_comprador": "test@re.com",
+    "direccion_envio": "Qfjwfneg",
+    "compras": [
+      {
+        "id": "prod_001",
+        "name": "Refresco Instantáneo (2Lt)",
+        "quantity": 1,
+        "unitPrice": 0.17
+      },
+      {
+        "id": "prod_002",
+        "name": "Carne de cerdo x Lb",
+        "quantity": 1,
+        "unitPrice": 2.9
+      }
+    ],
+    "precio_compra_total": "3.07",
+    "navegador": "Chrome",
+    "sistema_operativo": "Linux",
+    "tipo_usuario": "Recurrente",
+    "tiempo_promedio_pagina": 0,
+    "fuente_trafico": "Directo"
   }
 ]
