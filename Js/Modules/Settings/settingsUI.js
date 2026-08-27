@@ -3,9 +3,9 @@
  * Maneja la interacción de la UI en la sección de Settings
  */
 
-import { GitHubManager } from '../Github/githubManager.js';
-import { showAlert } from '../../Core/utils.js';
-import { confirm as modalConfirm } from '../../UI/modalUtils.js';
+import { GitHubManager } from '../Github/github.js';
+import { showAlert } from '../../Core/core.js';
+import { confirm as modalConfirm } from '../../UI/ui.js';
 
 export class SettingsUI {
     constructor() {

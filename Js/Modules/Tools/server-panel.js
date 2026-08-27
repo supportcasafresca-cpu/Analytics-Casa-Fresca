@@ -2,10 +2,8 @@
  * SERVER PANEL - Lógica del panel de control del servidor
  * ═══════════════════════════════════════════════════════════ */
 
-import { GitHubManager } from "../Github/githubManager.js";
-import { GitHubSaveModal } from "../Github/githubSaveModal.js";
-import { showAlert } from "../../Core/utils.js";
-import { CONFIG } from "../../Core/config.js";
+import { GitHubManager, GitHubSaveModal } from "../Github/github.js";
+import { showAlert, CONFIG } from "../../Core/core.js";
 
 const BACKEND_URL = CONFIG.BACKEND_URL;
 

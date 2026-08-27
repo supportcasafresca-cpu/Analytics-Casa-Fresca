@@ -3,14 +3,11 @@
  * Versión 2.0 - Modularizada
  */
 
-import { DataManager } from './Core/dataManager.js';
-import { ChartManager } from './UI/chartManager.js';
-import { UIRenderer } from './UI/uiRenderer.js';
+import { DataManager, CONFIG, showAlert, getCurrencySymbol, formatCurrency } from './Core/core.js';
+import { ChartManager, UIRenderer } from './UI/ui.js';
 import { SettingsUI } from './Modules/Settings/settingsUI.js';
-import { InventoryApp } from './Modules/Inventory/inventoryApp.js';
-import { GitHubManager } from './Modules/Github/githubManager.js';
-import { showAlert, getCurrencySymbol, formatCurrency } from './Core/utils.js';
-import { CONFIG } from './Core/config.js';
+import { InventoryApp } from './Modules/Inventory/inventory.js';
+import { GitHubManager } from './Modules/Github/github.js';
 
 /**
  * Manager para controlar el loading panel con animaciones mejoradas
