@@ -3,17 +3,13 @@
    (Express + Firebase RTDB + Cloudinary) ya existentes.
    ========================================================================= */
 
-// Cloud de Cloudinary fijo del negocio: ya no se pide por interfaz, así se
-// evita que cualquiera que abra el panel pueda cambiarlo por error o a propósito.
-const CLOUDINARY_CLOUD_NAME = 'vgvdzqql';
-
-// Limpieza de una config vieja que ya no se usa (si algún navegador la tenía guardada).
-localStorage.removeItem('panel_cloud_name');
+const CLOUDINARY_PRODUCTS_FOLDER = 'products';
+const CLOUDINARY_PACKS_FOLDER = 'packs';
 
 const state = {
   apiUrl: localStorage.getItem('panel_api_url') || '',
   authToken: localStorage.getItem('panel_auth_token') || '',
-  cloudName: CLOUDINARY_CLOUD_NAME,
+  cloudName: '',
   authenticated: false, // se pone en true solo tras un login válido contra el backend
   productos: [],
   infoMap: {},   // notas especiales por producto (id -> {id, info}), nodo "info" en Firebase
@@ -291,7 +287,7 @@ function parseCloudinaryUrl(url){
     let folder = '';
     let publicId = '';
     let transformations = '';
-    const knownFolders = ['products', 'packs'];
+    const knownFolders = [CLOUDINARY_PRODUCTS_FOLDER, CLOUDINARY_PACKS_FOLDER];
     if (afterUpload.length === 0) return null;
     if (knownFolders.includes(afterUpload[0])) {
       folder = afterUpload[0];
@@ -336,7 +332,7 @@ async function setImageMetaInfo(img, labelEl){
   labelEl.textContent = text;
 }
 
-function getImageDetailPayload(source, folder = 'products'){
+function getImageDetailPayload(source, folder = CLOUDINARY_PRODUCTS_FOLDER){
   const url = cloudinaryUrl(source, folder, 'detail');
   const cloudinaryInfo = url ? parseCloudinaryUrl(url) : null;
   return {
@@ -352,7 +348,7 @@ function getImageDetailPayload(source, folder = 'products'){
   };
 }
 
-let imageDetailCtx = { sources: [], folder: 'products', index: 0 };
+let imageDetailCtx = { sources: [], folder: CLOUDINARY_PRODUCTS_FOLDER, index: 0 };
 
 function renderImageDetailThumbs(){
   const wrap = document.getElementById('img-detail-thumbs');
@@ -418,7 +414,7 @@ async function renderImageDetailCurrent(){
   imgPreview.src = payload.url;
 }
 
-async function showImageDetail(sourceOrList, folder = 'products', index = 0){
+async function showImageDetail(sourceOrList, folder = CLOUDINARY_PRODUCTS_FOLDER, index = 0){
   const sources = (Array.isArray(sourceOrList) ? sourceOrList : [sourceOrList]).filter(Boolean);
   if (!sources.length) return;
   imageDetailCtx = { sources, folder, index: Math.min(Math.max(index, 0), sources.length - 1) };
@@ -473,7 +469,7 @@ function installServiceWorker(){
 
 installServiceWorker();
 
-// folder: 'products' para inventario, 'packs' para packs — Cloudinary
+// Usa las carpetas configuradas en el backend para inventario y packs.
 // guarda cada tipo en una carpeta distinta y hay que respetarla al construir
 // la URL o la imagen simplemente no existe en esa ruta.
 const CLD_SIZES = {
@@ -481,7 +477,23 @@ const CLD_SIZES = {
   detail: { w: 1000 }
 };
 
-function cloudinaryUrl(publicId, folder = 'products', preset = null){
+function setCloudinaryCloudNameFromItems(items){
+  for (const item of items || []){
+    for (const imageUrl of item.imagenes_url || []){
+      try{
+        const parsed = new URL(imageUrl);
+        if (parsed.hostname.endsWith('.cloudinary.com')){
+          state.cloudName = parsed.hostname.split('.')[0];
+          return;
+        }
+      }catch(e){
+        continue;
+      }
+    }
+  }
+}
+
+function cloudinaryUrl(publicId, folder = CLOUDINARY_PRODUCTS_FOLDER, preset = null){
   if (!publicId) return null;
   if (/^https?:\/\//i.test(publicId) || publicId.startsWith('data:image')) return publicId;
   if (!state.cloudName) return null;
@@ -965,6 +977,7 @@ async function loadProductos(force = false){
     }
     const data = await apiFetch('/api/products');
     state.productos = data.products || [];
+    setCloudinaryCloudNameFromItems(state.productos);
     state._productosCacheTime = Date.now();
     await actualizarPedidosInventario(force);
     populateProductoCategoriasDropdown();
@@ -1209,7 +1222,7 @@ function renderProductos(){
 
   // Construimos el HTML en un solo paso para minimizar reflows.
   const html = list.map(p => {
-    const imgUrl = cloudinaryUrl((p.imagenes || [])[0], 'products', 'thumb');
+    const imgUrl = cloudinaryUrl((p.imagenes || [])[0], CLOUDINARY_PRODUCTS_FOLDER, 'thumb');
     const estado = estadoStockProducto(p);
     const available = p.disponibilidad !== false;
     const stockPill = estado === 'sin' ? `<span class="pill pill-danger">⚠ Sin stock</span>` : estado === 'bajo' ? `<span class="pill pill-warn">⏳ Stock bajo</span>` : '';
@@ -1310,7 +1323,7 @@ function renderProductos(){
       e.stopPropagation();
       const id = imgDetail.dataset.imgDetail;
       const prod = state.productos.find(x => x.id === id);
-      if (prod) showImageDetail(prod.imagenes || [], 'products', 0);
+      if (prod) showImageDetail(prod.imagenes || [], CLOUDINARY_PRODUCTS_FOLDER, 0);
     }
   };
 
@@ -1427,7 +1440,7 @@ function openProductoModal(id){
   openModal('modal-producto');
 }
 
-function renderImageGrid(gridId, images, folder = 'products'){
+function renderImageGrid(gridId, images, folder = CLOUDINARY_PRODUCTS_FOLDER){
   const grid = document.getElementById(gridId);
   grid.innerHTML = '';
   images.forEach((img, idx) => {
@@ -1460,7 +1473,7 @@ function renderImageGrid(gridId, images, folder = 'products'){
     btn.addEventListener('click', () => {
       const arr = gridId === 'prod-image-grid' ? state.prodImages : state.packImages;
       arr.splice(Number(btn.dataset.idx), 1);
-      renderImageGrid(gridId, arr, gridId === 'prod-image-grid' ? 'products' : 'packs');
+      renderImageGrid(gridId, arr, gridId === 'prod-image-grid' ? CLOUDINARY_PRODUCTS_FOLDER : CLOUDINARY_PACKS_FOLDER);
     });
   });
 }
@@ -1563,6 +1576,7 @@ async function loadPacks(){
   try{
     const packsData = await apiFetch('/api/packs');
     state.packs = packsData.packs || [];
+    setCloudinaryCloudNameFromItems(state.packs);
     renderPacks();
   }catch(e){ showToast('Error cargando packs: ' + e.message, true); }
 }
@@ -1587,7 +1601,7 @@ function renderPacks(){
   document.getElementById('pack-empty').hidden = list.length !== 0;
 
   list.forEach(p => {
-    const imgUrl = cloudinaryUrl((p.imagenes || [])[0] || p.imagen, 'packs', 'thumb');
+    const imgUrl = cloudinaryUrl((p.imagenes || [])[0] || p.imagen, CLOUDINARY_PACKS_FOLDER, 'thumb');
     const caracteristicas = Array.isArray(p.caracteristicas)
       ? p.caracteristicas
       : (p.caracteristicas ? String(p.caracteristicas).split(/\r?\n/) : []);
@@ -1653,7 +1667,7 @@ function renderPacks(){
       packDetailBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         const packSources = (p.imagenes && p.imagenes.length) ? p.imagenes : (p.imagen ? [p.imagen] : []);
-        showImageDetail(packSources, 'packs', 0);
+        showImageDetail(packSources, CLOUDINARY_PACKS_FOLDER, 0);
       });
     }
   });
@@ -1696,7 +1710,7 @@ function openPackModal(id){
   recalcPackOferta();
 
   state.packImages = p ? [...(p.imagenes || (p.imagen ? [p.imagen] : []))] : [];
-  renderImageGrid('pack-image-grid', state.packImages, 'packs');
+  renderImageGrid('pack-image-grid', state.packImages, CLOUDINARY_PACKS_FOLDER);
 
   openModal('modal-pack');
 }
@@ -1709,7 +1723,7 @@ document.getElementById('pack-file-input').addEventListener('change', async (e) 
       const dataUrl = await compressImage(file);
       state.packImages.push(dataUrl);
     }
-    renderImageGrid('pack-image-grid', state.packImages, 'packs');
+    renderImageGrid('pack-image-grid', state.packImages, CLOUDINARY_PACKS_FOLDER);
     hint.textContent = '';
   }catch(err){
     hint.textContent = 'No se pudo procesar la imagen: ' + err.message;
