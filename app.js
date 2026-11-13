@@ -1,0 +1,5484 @@
+/* =========================================================================
+   Panel de gestión — se conecta directamente a los endpoints del backend
+   (Express + Firebase RTDB + Cloudinary) ya existentes.
+   ========================================================================= */
+
+// Cloud de Cloudinary fijo del negocio: ya no se pide por interfaz, así se
+// evita que cualquiera que abra el panel pueda cambiarlo por error o a propósito.
+const CLOUDINARY_CLOUD_NAME = 'vgvdzqql';
+
+// Limpieza de una config vieja que ya no se usa (si algún navegador la tenía guardada).
+localStorage.removeItem('panel_cloud_name');
+
+const state = {
+  apiUrl: localStorage.getItem('panel_api_url') || '',
+  authToken: localStorage.getItem('panel_auth_token') || '',
+  cloudName: CLOUDINARY_CLOUD_NAME,
+  authenticated: false, // se pone en true solo tras un login válido contra el backend
+  productos: [],
+  infoMap: {},   // notas especiales por producto (id -> {id, info}), nodo "info" en Firebase
+  packs: [],
+  pedidosNuevos: [],
+  pedidosSeguimiento: [],
+  usuarios: [],
+  usuariosPage: 1,
+  usuariosPageSize: 50,
+  usuariosQuery: '',
+  clientes: [],
+  clientesQuery: '',
+  inventarioPedidos: [],
+  inventarioPedidosAt: 0,
+  inventarioPedidosError: false,
+  inventarioDemanda: new Map(),
+  inventarioVista: localStorage.getItem('panel_inventario_vista') || 'tarjetas',
+  inventarioOrden: localStorage.getItem('panel_inventario_orden') || 'urgencia',
+  prodImages: [],   // imágenes en edición del modal de producto (public_id o dataURL)
+  packImages: [],   // imágenes en edición del modal de pack
+  invTab: 'todos',  // pestaña activa en Inventario: todos | bajo | sin | control
+  packTab: 'todos',
+  stockUmbral: Number(localStorage.getItem('panel_stock_umbral') || 10),
+  resumenRango: { preset: 'hoy', desde: null, hasta: null }, // rango activo en Resumen
+};
+
+/* ---------------------------- Helpers de red ---------------------------- */
+
+function apiUrlOk(){
+  return state.apiUrl && state.apiUrl.trim().length > 0;
+}
+
+function authHeaders(){
+  return state.authToken ? { 'Authorization': 'Bearer ' + state.authToken } : {};
+}
+
+function setAuthToken(token){
+  state.authToken = token || '';
+  if (token) localStorage.setItem('panel_auth_token', token);
+  else localStorage.removeItem('panel_auth_token');
+}
+
+/* Helpers "seguros" para tocar el DOM: si el elemento no existe (por ejemplo
+   porque el móvil todavía tiene en caché una versión vieja de index.html/app.js
+   que no coincide entre sí), no se rompe todo el script con
+   "Cannot set properties of null". */
+function setText(id, value){
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
+  return el;
+}
+function setHtml(id, value){
+  const el = document.getElementById(id);
+  if (el) el.innerHTML = value;
+  return el;
+}
+
+// Normaliza texto para búsquedas: minúsculas y sin tildes/diacríticos, así
+// "cafe" encuentra "Café" y viceversa en cualquier buscador del panel.
+function normalizeText(str){
+  return String(str || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
+
+// Pequeño debounce utilitario para evitar ejecuciones frecuentes en
+// scroll/resize o inputs rápidos.
+function debounce(fn, wait = 80){
+  let t = null;
+  return function(...args){
+    clearTimeout(t);
+    t = setTimeout(() => fn.apply(this, args), wait);
+  };
+}
+
+/* ------------------------- Caché de peticiones ------------------------- */
+// El panel cambia de pestaña con frecuencia y cada cambio volvía a descargar
+// los mismos listados (pedidos, pedidos asignados, estadísticas...). Esta
+// caché evita peticiones repetidas dentro de una ventana corta, deduplica las
+// que van en paralelo y aprovecha el ETag del backend (304 = "no cambió", sin
+// cuerpo). Cualquier escritura limpia la caché para que los cambios se vean
+// al instante.
+const API_CACHE_TTL_MS = 30 * 1000;
+const apiGetCache = new Map();   // key -> { data, at, etag }
+const apiInflight = new Map();   // key -> Promise
+let apiCacheGeneration = 0;
+
+function invalidateApiCache(){
+  apiGetCache.clear();
+  apiInflight.clear();
+  apiCacheGeneration += 1;
+}
+
+async function apiFetch(path, options = {}){
+  if (!apiUrlOk()){
+    showToast('Configura primero la URL del backend en "Conexión".', true);
+    goToView('config');
+    throw new Error('API URL no configurada');
+  }
+  const base = state.apiUrl.replace(/\/$/, '');
+  const method = String(options.method || 'GET').toUpperCase();
+  const isGet = method === 'GET';
+  const force = Boolean(options.force);
+  const ttl = Number.isFinite(options.ttl) ? Number(options.ttl) : API_CACHE_TTL_MS;
+  const { force: _force, ttl: _ttl, ...fetchOptions } = options;
+  // El token entra en la clave: al iniciar/cerrar sesión no se reutiliza una
+  // respuesta anterior con otro estado de autenticación.
+  const key = `${method} ${base}${path} ${state.authToken || ''}`;
+  const cached = isGet ? apiGetCache.get(key) : null;
+  const generationAtStart = apiCacheGeneration;
+
+  if (isGet && !force && cached && (Date.now() - cached.at) < ttl) return cached.data;
+  if (isGet && apiInflight.has(key)) return apiInflight.get(key);
+
+  const run = (async () => {
+    const headers = { 'Content-Type': 'application/json', ...authHeaders(), ...(fetchOptions.headers || {}) };
+    if (isGet && cached && cached.etag) headers['If-None-Match'] = cached.etag;
+
+    let res;
+    try {
+      res = await fetch(base + path, {
+        credentials: 'include',
+        cache: 'no-store',
+        ...fetchOptions,
+        method,
+        headers
+      });
+    } catch (networkErr) {
+      setOfflineBanner(true);
+      throw new Error('Sin conexión con el backend. Verifica tu internet.');
+    }
+    setOfflineBanner(false);
+    if (res.status === 401){
+      // La sesión no existe o expiró: ocultar la app y volver a pedir login.
+      setAuthToken(null);
+      lockApp();
+      showAuthGate();
+      throw new Error('Sesión no iniciada. Inicia sesión para continuar.');
+    }
+
+    // 304: el backend confirma que no cambió nada y reutilizamos lo cacheado.
+    if (isGet && res.status === 304 && cached){
+      cached.at = Date.now();
+      return cached.data;
+    }
+
+    let data = null;
+    try { data = await res.json(); } catch (e) { /* respuesta sin cuerpo JSON */ }
+    if (!res.ok){
+      const msg = (data && (data.message || data.error)) || `Error HTTP ${res.status}`;
+      throw new Error(msg);
+    }
+    if (isGet){
+      // Si hubo una escritura mientras esta lectura estaba en vuelo, el
+      // resultado ya es viejo: se devuelve pero no se guarda en caché.
+      if (generationAtStart === apiCacheGeneration){
+        apiGetCache.set(key, { data, at: Date.now(), etag: res.headers.get('ETag') || null });
+      }
+    } else {
+      // Cualquier escritura invalida los listados cacheados.
+      invalidateApiCache();
+    }
+    return data;
+  })();
+
+  if (isGet){
+    apiInflight.set(key, run);
+    // La promesa original sigue siendo la que recibe el llamador; este
+    // finally solo limpia el mapa de peticiones en vuelo.
+    run.finally(() => {
+      if (apiInflight.get(key) === run) apiInflight.delete(key);
+    }).catch(() => {});
+  }
+  return run;
+}
+
+function setOfflineBanner(show){
+  const banner = document.getElementById('offline-banner');
+  if (!banner) return;
+  banner.hidden = !show;
+}
+window.addEventListener('offline', () => setOfflineBanner(true));
+window.addEventListener('online', () => setOfflineBanner(false));
+
+function showToast(msg, isError = false){
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (isError ? ' err' : '');
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => { t.className = 'toast'; }, 3200);
+}
+
+function inferImageFormat(url){
+  if (!url) return 'IMG';
+  const path = url.split('?')[0].split('#')[0];
+  const extMatch = path.match(/\.(jpg|jpeg|png|webp|gif|svg)(?:$|\?|#)/i);
+  if (extMatch) return extMatch[1].toUpperCase();
+  if (url.includes('/f_webp/')) return 'WEBP';
+  if (url.includes('/f_png/')) return 'PNG';
+  if (url.includes('/f_jpg/') || url.includes('/f_jpeg/')) return 'JPG';
+  return 'IMG';
+}
+
+function formatBytes(bytes){
+  if (!bytes || bytes < 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function formatUsageBytes(bytes){
+  if (!bytes || bytes < 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+async function loadCloudinaryUsage(){
+  const hint = document.getElementById('cld-usage-hint');
+  try{
+    const data = await apiFetch('/api/admin/cloudinary-usage');
+    const usage = data.usage || {};
+    const credits = usage.credits || {};
+    setText('cld-credits', credits.used_percent != null ? `${Number(credits.used_percent).toFixed(1)}%` : (credits.usage != null ? String(credits.usage) : '—'));
+    setText('cld-credits-sub', credits.limit != null ? `de ${credits.limit} créditos` : (usage.plan ? `Plan ${usage.plan}` : '—'));
+    setText('cld-storage', usage.storage && usage.storage.usage != null ? formatUsageBytes(usage.storage.usage) : '—');
+    setText('cld-bandwidth', usage.bandwidth && usage.bandwidth.usage != null ? formatUsageBytes(usage.bandwidth.usage) : '—');
+    setText('cld-transformations', usage.transformations && usage.transformations.usage != null ? String(usage.transformations.usage) : '—');
+    setText('cld-resources', usage.resources != null ? String(usage.resources) : '—');
+    setText('cld-requests', usage.requests != null ? String(usage.requests) : '—');
+    if (hint){
+      hint.textContent = usage.last_updated ? `Datos de Cloudinary actualizados: ${usage.last_updated}` : '';
+      hint.className = 'hint';
+    }
+  }catch(e){
+    if (hint){
+      hint.textContent = 'No se pudo cargar el uso de Cloudinary: ' + e.message;
+      hint.className = 'hint err';
+    }
+  }
+}
+
+async function fetchImageSize(url){
+  if (!url) return null;
+  try {
+    const res = await fetch(url, { method: 'HEAD', mode: 'cors' });
+    if (res.ok) {
+      const contentLength = res.headers.get('content-length');
+      if (contentLength) return Number(contentLength);
+    }
+  } catch (err) {
+    // No pasa nada, se intentará con GET.
+  }
+  try {
+    const res = await fetch(url, { method: 'GET', mode: 'cors' });
+    if (!res.ok) return null;
+    const blob = await res.blob();
+    return blob.size;
+  } catch (err) {
+    return null;
+  }
+}
+
+function parseCloudinaryUrl(url){
+  try {
+    const parsed = new URL(url);
+    const isCloudinary = parsed.hostname.endsWith('cloudinary.com');
+    if (!isCloudinary) return null;
+    const path = parsed.pathname.split('/').filter(Boolean);
+    const uploadIndex = path.indexOf('upload');
+    if (uploadIndex < 0) return null;
+    const afterUpload = path.slice(uploadIndex + 1);
+    let folder = '';
+    let publicId = '';
+    let transformations = '';
+    const knownFolders = ['products', 'packs'];
+    if (afterUpload.length === 0) return null;
+    if (knownFolders.includes(afterUpload[0])) {
+      folder = afterUpload[0];
+      publicId = afterUpload.slice(1).join('/');
+    } else if (afterUpload.length > 1 && knownFolders.includes(afterUpload[1])) {
+      transformations = afterUpload[0];
+      folder = afterUpload[1];
+      publicId = afterUpload.slice(2).join('/');
+    } else {
+      publicId = afterUpload.join('/');
+    }
+    const extension = publicId ? (publicId.split('.').pop().toUpperCase() || null) : null;
+    const format = extension || (transformations.includes('f_webp') ? 'WEBP' : transformations.includes('f_png') ? 'PNG' : transformations.includes('f_jpg') ? 'JPG' : 'IMG');
+    return {
+      cloudName: parsed.hostname.split('.')[0],
+      folder,
+      publicId,
+      format,
+      transformations,
+      url: parsed.href,
+      origin: 'cloudinary'
+    };
+  } catch (err) {
+    return null;
+  }
+}
+
+async function setImageMetaInfo(img, labelEl){
+  if (!img || !labelEl) return;
+  const format = inferImageFormat(img.currentSrc || img.src || '');
+  const width = img.naturalWidth;
+  const height = img.naturalHeight;
+  let text = format;
+  if (width && height) {
+    text += ` · ${width}×${height}`;
+  }
+  const size = await fetchImageSize(img.currentSrc || img.src || '');
+  if (size) {
+    text += ` · ${formatBytes(size)}`;
+    labelEl.classList.toggle('image-meta-large', size > 200 * 1024);
+  }
+  labelEl.textContent = text;
+}
+
+function getImageDetailPayload(source, folder = 'products'){
+  const url = cloudinaryUrl(source, folder, 'detail');
+  const cloudinaryInfo = url ? parseCloudinaryUrl(url) : null;
+  return {
+    source: source || '—',
+    url: url || source || '—',
+    cloudName: cloudinaryInfo?.cloudName || '—',
+    folder: cloudinaryInfo?.folder || folder || '—',
+    publicId: cloudinaryInfo?.publicId || (source && source.startsWith('data:') ? 'Embedded data URL' : '—'),
+    format: cloudinaryInfo?.format || inferImageFormat(url || source || ''),
+    width: 0,
+    height: 0,
+    size: null
+  };
+}
+
+let imageDetailCtx = { sources: [], folder: 'products', index: 0 };
+
+function renderImageDetailThumbs(){
+  const wrap = document.getElementById('img-detail-thumbs');
+  const countEl = document.getElementById('img-detail-count');
+  if (!wrap) return;
+  const { sources, folder, index } = imageDetailCtx;
+  if (sources.length <= 1) {
+    wrap.hidden = true;
+    wrap.innerHTML = '';
+    if (countEl) countEl.textContent = '';
+    return;
+  }
+  if (countEl) countEl.textContent = `${index + 1} de ${sources.length}`;
+  wrap.hidden = false;
+  wrap.innerHTML = sources.map((src, i) => {
+    const url = cloudinaryUrl(src, folder, 'thumb') || src;
+    return `<button type="button" class="img-detail-thumb${i === index ? ' active' : ''}" data-idx="${i}"><img src="${url}" alt="Imagen ${i + 1}" loading="lazy" decoding="async"></button>`;
+  }).join('');
+  wrap.querySelectorAll('[data-idx]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      imageDetailCtx.index = Number(btn.dataset.idx);
+      renderImageDetailThumbs();
+      renderImageDetailCurrent();
+    });
+  });
+}
+
+async function renderImageDetailCurrent(){
+  const { sources, folder, index } = imageDetailCtx;
+  const source = sources[index];
+  const payload = getImageDetailPayload(source, folder);
+  const imgPreview = document.getElementById('img-detail-preview');
+  const nameEl = document.getElementById('img-detail-name');
+  const cloudEl = document.getElementById('img-detail-cloud');
+  const formatEl = document.getElementById('img-detail-format');
+  const sizeEl = document.getElementById('img-detail-size');
+  const dimEl = document.getElementById('img-detail-dimensions');
+  const urlEl = document.getElementById('img-detail-url');
+
+  imgPreview.alt = payload.publicId || 'Vista previa de imagen';
+  nameEl.textContent = payload.publicId;
+  cloudEl.textContent = payload.cloudName !== '—' ? `${payload.cloudName}/${payload.folder}` : '—';
+  formatEl.textContent = payload.format;
+  sizeEl.textContent = 'Cargando...';
+  dimEl.textContent = 'Cargando...';
+  urlEl.href = payload.url;
+  urlEl.textContent = payload.url;
+
+  imgPreview.onload = async () => {
+    dimEl.textContent = `${imgPreview.naturalWidth}×${imgPreview.naturalHeight}`;
+    const size = await fetchImageSize(payload.url);
+    if (size) {
+      sizeEl.textContent = formatBytes(size);
+    } else {
+      sizeEl.textContent = 'Desconocido';
+    }
+  };
+  imgPreview.onerror = () => {
+    dimEl.textContent = 'No disponible';
+    sizeEl.textContent = 'No disponible';
+  };
+
+  imgPreview.src = payload.url;
+}
+
+async function showImageDetail(sourceOrList, folder = 'products', index = 0){
+  const sources = (Array.isArray(sourceOrList) ? sourceOrList : [sourceOrList]).filter(Boolean);
+  if (!sources.length) return;
+  imageDetailCtx = { sources, folder, index: Math.min(Math.max(index, 0), sources.length - 1) };
+  renderImageDetailThumbs();
+  await renderImageDetailCurrent();
+  openModal('modal-image-detail');
+}
+
+function installServiceWorker(){
+  if (!('serviceWorker' in navigator)) return;
+
+  // Evita que se recargue en bucle si hay varias pestañas abiertas.
+  let hasReloaded = false;
+
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (hasReloaded) return;
+    hasReloaded = true;
+    window.location.reload();
+  });
+
+  navigator.serviceWorker.register('./sw.js')
+    .then(registration => {
+      console.log('Service worker registrado.');
+
+      // Si ya hay un SW esperando (detectado en una carga anterior), actívalo ya.
+      if (registration.waiting) {
+        registration.waiting.postMessage('SKIP_WAITING');
+      }
+
+      // Cuando se detecta una versión nueva del SW, actívala apenas termine
+      // de instalarse en vez de esperar a que se cierren todas las pestañas.
+      registration.addEventListener('updatefound', () => {
+        const newWorker = registration.installing;
+        if (!newWorker) return;
+        newWorker.addEventListener('statechange', () => {
+          if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+            newWorker.postMessage('SKIP_WAITING');
+          }
+        });
+      });
+
+      // Revisa si hay una versión nueva del SW cada vez que la pestaña
+      // vuelve a estar visible (además del chequeo automático del navegador).
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+          registration.update();
+        }
+      });
+    })
+    .catch(() => console.warn('No se pudo registrar el service worker.'));
+}
+
+installServiceWorker();
+
+// folder: 'products' para inventario, 'packs' para packs — Cloudinary
+// guarda cada tipo en una carpeta distinta y hay que respetarla al construir
+// la URL o la imagen simplemente no existe en esa ruta.
+const CLD_SIZES = {
+  thumb: { w: 320 },
+  detail: { w: 1000 }
+};
+
+function cloudinaryUrl(publicId, folder = 'products', preset = null){
+  if (!publicId) return null;
+  if (/^https?:\/\//i.test(publicId) || publicId.startsWith('data:image')) return publicId;
+  if (!state.cloudName) return null;
+  const size = preset ? CLD_SIZES[preset] : null;
+  let transform = 'f_webp,q_auto';
+  if (size && size.w){
+    transform += `,c_limit,w_${size.w}`;
+  }
+  return `https://res.cloudinary.com/${state.cloudName}/image/upload/${transform}/${folder}/${encodeURIComponent(publicId)}`;
+}
+
+function fileToDataUrl(file){
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function compressImage(file, maxDim = 1000, quality = 0.72){
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim){
+          const scale = maxDim / Math.max(width, height);
+          width = Math.round(width * scale);
+          height = Math.round(height * scale);
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/webp', quality));
+      };
+      img.onerror = reject;
+      img.src = reader.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+/* ------------------------------ Navegación ------------------------------ */
+
+/* ---------------------- Aviso visual de scroll en seg-tabs ---------------------- */
+/* Cuando un grupo de pestañas (seg-tabs) no cabe en pantalla y hay que
+   deslizar para ver el resto (ej. "Con control" en Inventario), se marca
+   con una clase que activa un degradado en el borde para que se note que
+   hay más pestañas fuera de vista, en vez de que parezca simplemente
+   cortado/oculto. */
+function updateSegTabsFade(el){
+  if (!el) return;
+  const max = el.scrollWidth - el.clientWidth;
+  const overflowing = max > 2;
+  el.classList.toggle('scroll-fade-left', overflowing && el.scrollLeft > 2);
+  el.classList.toggle('scroll-fade-right', overflowing && el.scrollLeft < max - 2);
+}
+
+// Alinea un tab dentro de su contenedor `.seg-tabs` asegurando que quede
+// totalmente visible (útil en móviles cuando hay que desplazar para ver el
+// botón). Usa comportamientos suaves y evita saltos bruscos.
+function ensureSegTabVisible(tab){
+  if (!tab) return;
+  const container = tab.closest('.seg-tabs');
+  if (!container) return;
+  // Si el tab ya está completamente dentro del viewport del contenedor, no hacemos nada.
+  const tabRect = tab.getBoundingClientRect();
+  const contRect = container.getBoundingClientRect();
+  const leftOverflow = tabRect.left < contRect.left + 6; // margen pequeño
+  const rightOverflow = tabRect.right > contRect.right - 6;
+  if (!leftOverflow && !rightOverflow) return;
+
+  // Calcula la posición a desplazar: preferimos centrar ligeramente el tab
+  // o desplazar lo justo para que esté completamente visible.
+  const scrollLeft = container.scrollLeft + (tabRect.left - contRect.left) - 12;
+  // Si el tab sale por la derecha, ajustamos para que su borde derecho quede dentro.
+  const scrollRight = container.scrollLeft + (tabRect.right - contRect.right) + 12;
+  const target = rightOverflow ? scrollRight : scrollLeft;
+  container.scrollTo({ left: target, behavior: 'smooth' });
+}
+function refreshAllSegTabsFade(){
+  document.querySelectorAll('.seg-tabs').forEach(updateSegTabsFade);
+}
+document.addEventListener('scroll', debounce((e) => {
+  const t = e.target;
+  if (t && t.classList && t.classList.contains('seg-tabs')) updateSegTabsFade(t);
+}, 40), { capture: true, passive: true });
+window.addEventListener('resize', debounce(refreshAllSegTabsFade, 120));
+if (window.ResizeObserver){
+  const segTabsObserver = new ResizeObserver(entries => {
+    entries.forEach(entry => updateSegTabsFade(entry.target));
+  });
+  document.querySelectorAll('.seg-tabs').forEach(el => segTabsObserver.observe(el));
+}
+document.addEventListener('DOMContentLoaded', () => requestAnimationFrame(refreshAllSegTabsFade));
+
+function goToView(view){
+  // Blindaje: aunque alguien oculte el overlay de login a mano con devtools,
+  // esta función sigue sin dejar cambiar de pestaña sin sesión válida.
+  if (!state.authenticated){
+    console.warn('Navegación bloqueada: no hay sesión iniciada.');
+    return;
+  }
+  document.querySelectorAll('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.view === view));
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  const target = document.getElementById('view-' + view);
+  if (!target){
+    console.warn('Vista no encontrada:', view);
+    return;
+  }
+  target.classList.add('active');
+
+  if (view === 'resumen') loadResumen();
+  if (view === 'inventario') loadProductos();
+  if (view === 'packs') loadPacks();
+  if (view === 'pedidos') loadPedidosSection();
+  if (view === 'usuarios'){ loadUsuarios(); loadClientes(); }
+  if (view === 'notificaciones') loadNotificationBanner();
+  if (view === 'config') loadCloudinaryUsage();
+  requestAnimationFrame(refreshAllSegTabsFade);
+}
+
+document.querySelectorAll('.nav-item').forEach(btn => {
+  btn.addEventListener('click', () => goToView(btn.dataset.view));
+});
+
+// Cuando se hace click en cualquier `.seg-tab`, marcar como activa y
+// desplazarla dentro de su contenedor para que sea visible en pantallas pequeñas.
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest && e.target.closest('.seg-tab');
+  if (!btn) return;
+  const parent = btn.closest('.seg-tabs');
+  if (!parent) return;
+  parent.querySelectorAll('.seg-tab').forEach(b => b.classList.toggle('active', b === btn));
+  // Esperamos un frame para permitir que cualquier cambio visual se aplique,
+  // luego forzamos el desplazamiento si es necesario.
+  requestAnimationFrame(() => ensureSegTabVisible(btn));
+});
+
+// Al cargar el DOM, aseguramos que la pestaña activa (si la hay) quede visible.
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('.seg-tabs').forEach(group => {
+    const active = group.querySelector('.seg-tab.active');
+    if (active) ensureSegTabVisible(active);
+  });
+});
+
+// Contador para apilar modales (ej. abrir un pedido desde dentro del modal
+// de "Ventas por producto"). Todos los .modal-backdrop comparten z-index:100,
+// así que sin esto el modal recién abierto quedaba DETRÁS del que ya estaba
+// abierto en el DOM. Con este contador, cada modal abierto sube por encima.
+let modalZCounter = 110;
+function openModal(id){
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.style.zIndex = String(modalZCounter++);
+  el.classList.add('open');
+}
+function closeModal(id){ document.getElementById(id).classList.remove('open'); }
+document.querySelectorAll('[data-close]').forEach(el => {
+  el.addEventListener('click', () => closeModal(el.dataset.close));
+});
+document.querySelectorAll('.modal-backdrop').forEach(el => {
+  el.addEventListener('click', (e) => { if (e.target === el) el.classList.remove('open'); });
+});
+
+/* Modales en móvil: la hoja inferior (bottom-sheet) queda anclada abajo y, al
+   abrirse el teclado virtual, algunos campos quedan ocultos detrás del teclado
+   y el modal "parece que no se expande". Este handler desplaza únicamente el
+   contenido del modal (modal-body) para revelar el campo enfocado, sin mover la
+   página de fondo. */
+(function initModalMobileFocus(){
+  const small = () => window.matchMedia && window.matchMedia('(max-width: 640px)').matches;
+  function revealFocused(target){
+    if (!small()) return;
+    const body = target.closest && target.closest('.modal-body');
+    if (!body) return;
+    const t = target.getBoundingClientRect();
+    const c = body.getBoundingClientRect();
+    if (t.bottom > c.bottom){
+      body.scrollTop += t.bottom - c.bottom + 16;
+    } else if (t.top < c.top){
+      body.scrollTop -= c.top - t.top + 16;
+    }
+  }
+  document.addEventListener('focusin', (e) => {
+    const el = e.target;
+    if (!el || typeof el.matches !== 'function') return;
+    if (!el.matches('input, textarea, select')) return;
+    const bd = (el.closest && el.closest('.modal-backdrop')) || null;
+    if (!bd || !bd.classList.contains('open')) return;
+    setTimeout(() => revealFocused(el), 140);
+  });
+})();
+
+/* ------------------------------- Conexión -------------------------------- */
+
+function setConnStatus(mode, text){
+  const el = document.getElementById('connStatus');
+  el.className = 'conn-status ' + mode;
+  setText('connStatusText', text);
+}
+
+async function testConnection(){
+  try{
+    await apiFetch('/api/products');
+    setConnStatus('ok', 'Conectado');
+    return true;
+  }catch(e){
+    setConnStatus('err', 'Sin conexión');
+    return false;
+  }
+}
+
+document.getElementById('cfg-save').addEventListener('click', async () => {
+  const url = document.getElementById('cfg-api-url').value.trim();
+  state.apiUrl = url;
+  localStorage.setItem('panel_api_url', url);
+
+  const result = document.getElementById('cfg-result');
+  result.textContent = 'Probando conexión...';
+  result.className = 'hint';
+
+  // Si se cambia el backend estando ya dentro del panel, la sesión de la
+  // URL anterior no sirve para la nueva: hay que volver a pedir login.
+  const authenticated = await checkAuth();
+  if (!authenticated){
+    result.textContent = 'Backend guardado. Inicia sesión de nuevo para continuar.';
+    result.className = 'hint err';
+    lockApp();
+    showAuthGate();
+    return;
+  }
+
+  const ok = await testConnection();
+  if (ok){
+    result.textContent = '✓ Conectado correctamente al backend.';
+    result.className = 'hint ok';
+    loadPedidosSection();
+    loadNotificationBanner();
+    loadCloudinaryUsage();
+  } else {
+    result.textContent = '✕ No se pudo conectar. Revisa la URL (debe incluir https:// y estar accesible).';
+    result.className = 'hint err';
+  }
+});
+
+async function downloadRtdbExport(database, button){
+  const result = document.getElementById('rtdb-export-result');
+  const label = database === 'principal' ? 'principal' : 'secundaria';
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Descargando…';
+  result.textContent = `Descargando RTDB ${label} completa…`;
+  result.className = 'hint';
+
+  try{
+    const base = state.apiUrl.replace(/\/$/, '');
+    const response = await fetch(`${base}/api/admin/rtdb-export/${database}`, {
+      credentials: 'include',
+      cache: 'no-store',
+      headers: authHeaders()
+    });
+
+    if (response.status === 401){
+      setAuthToken(null);
+      lockApp();
+      showAuthGate();
+      throw new Error('La sesión expiró. Inicia sesión para continuar.');
+    }
+
+    if (!response.ok){
+      const errorData = await response.json().catch(() => null);
+      throw new Error((errorData && (errorData.message || errorData.error))
+        || `No se pudo descargar la RTDB ${label} (HTTP ${response.status}).`);
+    }
+
+    const blob = await response.blob();
+    const downloadUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = downloadUrl;
+    anchor.download = `rtdb-${label}.json`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
+
+    result.textContent = `✓ Descarga de la RTDB ${label} completada.`;
+    result.className = 'hint ok';
+  }catch(error){
+    result.textContent = `✕ ${error.message || `Error al descargar la RTDB ${label}.`}`;
+    result.className = 'hint err';
+  }finally{
+    button.disabled = false;
+    button.textContent = originalText;
+  }
+}
+
+document.querySelectorAll('[data-rtdb-export]').forEach(button => {
+  button.addEventListener('click', () => downloadRtdbExport(button.dataset.rtdbExport, button));
+});
+
+document.getElementById('notif-save')?.addEventListener('click', saveNotificationBanner);
+document.getElementById('notif-load')?.addEventListener('click', loadNotificationBanner);
+
+
+
+function initConfigFields(){
+  document.getElementById('cfg-api-url').value = state.apiUrl;
+}
+
+const NOTIF_ICON_LIST = [
+  { value: 'fas fa-bell', preview: 'fa-solid fa-bell' },
+  { value: 'fas fa-info-circle', preview: 'fa-solid fa-info-circle' },
+  { value: 'fas fa-check-circle', preview: 'fa-solid fa-check-circle' },
+  { value: 'fas fa-exclamation-triangle', preview: 'fa-solid fa-exclamation-triangle' },
+  { value: 'fas fa-star', preview: 'fa-solid fa-star' },
+  { value: 'fas fa-percent', preview: 'fa-solid fa-percent' },
+  { value: 'fas fa-shipping-fast', preview: 'fa-solid fa-shipping-fast' },
+  { value: 'fas fa-gift', preview: 'fa-solid fa-gift' },
+  { value: 'fas fa-bolt', preview: 'fa-solid fa-bolt' },
+  { value: 'fas fa-tags', preview: 'fa-solid fa-tags' },
+  { value: 'fas fa-heart', preview: 'fa-solid fa-heart' },
+  { value: 'fas fa-thumbs-up', preview: 'fa-solid fa-thumbs-up' },
+  { value: 'fas fa-envelope', preview: 'fa-solid fa-envelope' },
+  { value: 'fas fa-location-dot', preview: 'fa-solid fa-location-dot' },
+  { value: 'fas fa-clock', preview: 'fa-solid fa-clock' },
+  { value: 'fas fa-cart-shopping', preview: 'fa-solid fa-cart-shopping' },
+  { value: 'fas fa-fire', preview: 'fa-solid fa-fire' },
+  { value: 'fas fa-rocket', preview: 'fa-solid fa-rocket' },
+  { value: 'fas fa-crown', preview: 'fa-solid fa-crown' },
+  { value: 'fas fa-megaphone', preview: 'fa-solid fa-megaphone' }
+];
+
+function setNotificationForm(banner){
+  const iconField = document.getElementById('notif-icono');
+  iconField.value = banner?.icono || '';
+  document.getElementById('notif-titulo').value = banner?.titulo || '';
+  document.getElementById('notif-subtitulo').value = banner?.subtitulo || '';
+  document.getElementById('notif-mensaje').value = banner?.mensaje || '';
+  document.getElementById('notif-tipo').value = banner?.tipo || 'info';
+  highlightNotificationIcon(iconField.value);
+}
+
+function normalizeIconClass(icon){
+  const raw = String(icon || '').trim();
+  if (!raw) return 'fa-solid fa-bell';
+
+  const normalized = raw
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (/^fa[srlbdk]-/i.test(normalized)) {
+    const parts = normalized.split(' ');
+    if (parts.length === 1) {
+      if (/^fa[srlbdk]-/i.test(parts[0])) return `${parts[0].startsWith('fa-') ? 'fa-solid' : 'fa-solid'} ${parts[0]}`;
+      return `fa-solid ${parts[0]}`;
+    }
+    const first = parts[0].toLowerCase();
+    const second = parts[1];
+    if (first === 'fas' || first === 'fa-solid') return `fa-solid ${second}`;
+    if (first === 'far' || first === 'fa-regular') return `fa-regular ${second}`;
+    if (first === 'fab' || first === 'fa-brands') return `fa-brands ${second}`;
+    if (first === 'fal' || first === 'fa-light') return `fa-light ${second}`;
+    return `fa-solid ${normalized}`;
+  }
+
+  if (normalized.startsWith('fa-')) return `fa-solid ${normalized}`;
+  return `fa-solid ${normalized}`;
+}
+
+function renderNotificationIconPicker(){
+  const picker = document.getElementById('notif-iconpicker');
+  if (!picker) return;
+  picker.innerHTML = NOTIF_ICON_LIST.map(icon => `
+    <button type="button" class="icon-select" data-icon="${icon.value}" title="${icon.value}" aria-label="${icon.value}">
+      <i class="${icon.preview}"></i>
+    </button>
+  `).join('');
+  picker.querySelectorAll('button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.getElementById('notif-icono').value = btn.dataset.icon;
+      highlightNotificationIcon(btn.dataset.icon);
+    });
+  });
+  const iconField = document.getElementById('notif-icono');
+  if (iconField) {
+    iconField.addEventListener('input', () => highlightNotificationIcon(iconField.value.trim()));
+    highlightNotificationIcon(iconField.value.trim());
+  }
+}
+
+function previewIconClass(icon){
+  return normalizeIconClass(icon);
+}
+
+function highlightNotificationIcon(selected){
+  const picker = document.getElementById('notif-iconpicker');
+  if (picker){
+    picker.querySelectorAll('button').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.icon === selected);
+    });
+  }
+  const preview = document.getElementById('notif-icon-preview');
+  if (!preview) return;
+  const iconEl = preview.querySelector('i');
+  if (!iconEl) return;
+  const previewClass = previewIconClass(selected);
+  iconEl.className = previewClass || 'fas fa-bell';
+}
+
+async function loadNotificationBanner(){
+  if (!apiUrlOk()) return;
+  const hint = document.getElementById('notif-hint');
+  hint.textContent = 'Cargando notificación...';
+  hint.className = 'hint';
+  try{
+    const data = await apiFetch('/api/notification-banner');
+    setNotificationForm(data.banner || {});
+    hint.textContent = data.banner ? 'Notificación cargada correctamente.' : 'No hay notificación definida aún.';
+    hint.className = 'hint ok';
+  }catch(e){
+    showToast('Error cargando la notificación: ' + e.message, true);
+    hint.textContent = 'No se pudo cargar la notificación.';
+    hint.className = 'hint err';
+  }
+}
+
+async function saveNotificationBanner(){
+  if (!apiUrlOk()) return;
+  const payload = {
+    icono: document.getElementById('notif-icono').value.trim(),
+    titulo: document.getElementById('notif-titulo').value.trim(),
+    subtitulo: document.getElementById('notif-subtitulo').value.trim(),
+    mensaje: document.getElementById('notif-mensaje').value.trim(),
+    tipo: document.getElementById('notif-tipo').value
+  };
+  try{
+    const data = await apiFetch('/api/notification-banner', { method: 'PUT', body: JSON.stringify(payload) });
+    setNotificationForm(data.banner || {});
+    showToast('Notificación guardada.');
+    const hint = document.getElementById('notif-hint');
+    hint.textContent = 'Notificación guardada correctamente.';
+    hint.className = 'hint ok';
+  }catch(e){
+    showToast('Error guardando la notificación: ' + e.message, true);
+    const hint = document.getElementById('notif-hint');
+    hint.textContent = 'No se pudo guardar la notificación.';
+    hint.className = 'hint err';
+  }
+}
+
+/* ================================================================
+   INVENTARIO (PRODUCTOS)  ->  /api/products
+   ================================================================ */
+
+async function actualizarPedidosInventario(forzar = false){
+  if (!forzar && state.inventarioPedidosAt && Date.now() - state.inventarioPedidosAt < 60000) return;
+  try{
+    state.inventarioPedidos = await cargarStockCheckPedidos(forzar);
+    state.inventarioPedidosError = false;
+  }catch(e){
+    state.inventarioPedidos = [];
+    state.inventarioPedidosError = true;
+  }
+  state.inventarioPedidosAt = Date.now();
+}
+
+async function loadProductos(force = false){
+  try{
+    const now = Date.now();
+    const TTL = 8000;
+    if (!force && state.productos && state.productos.length && state._productosCacheTime && (now - state._productosCacheTime) < TTL){
+      await actualizarPedidosInventario();
+      renderProductos();
+      return;
+    }
+    const data = await apiFetch('/api/products');
+    state.productos = data.products || [];
+    state._productosCacheTime = Date.now();
+    await actualizarPedidosInventario(force);
+    populateProductoCategoriasDropdown();
+    renderProductos();
+    loadInfoMap();
+  }catch(e){ showToast('Error cargando inventario: ' + e.message, true); }
+}
+
+async function loadInfoMap(){
+  try{
+    const data = await apiFetch('/api/info');
+    const lista = Array.isArray(data.info) ? data.info : [];
+    const map = {};
+    lista.forEach(entry => { if (entry && entry.id) map[entry.id] = entry; });
+    state.infoMap = map;
+  }catch(e){ /* nota especial: fallo silencioso, no bloquea el inventario */ }
+}
+
+function populateProductoCategoriasDropdown(){
+  const select = document.getElementById('prod-categoria');
+  if (!select) return;
+
+  const categorias = Array.from(new Set(
+    state.productos
+      .map(p => String(p.categoria || '').trim())
+      .filter(c => c && c.toLowerCase() !== 'pack')
+  ));
+
+  categorias.sort((a,b) => a.localeCompare(b, 'es', { sensitivity: 'base' }));
+
+  select.innerHTML = '<option value="">Seleccionar categoría</option>' +
+    categorias.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+}
+
+// Estado de stock de un producto, solo tiene sentido si "aplicar_stock" está
+// habilitado (si no, el stock guardado es informativo y no se avisa de nada).
+function estadoStockProducto(p){
+  if (!p.aplicar_stock) return 'na';
+  const stock = Number(p.stock ?? 0);
+  if (stock <= 0) return 'sin';
+  if (stock <= state.stockUmbral) return 'bajo';
+  return 'ok';
+}
+
+function contarProductosPorStock(){
+  let bajo = 0, sin = 0;
+  state.productos.forEach(p => {
+    const estado = estadoStockProducto(p);
+    if (estado === 'bajo') bajo++;
+    if (estado === 'sin') sin++;
+  });
+  return { bajo, sin };
+}
+
+function calcularStatsInventario(){
+  const total = state.productos.length;
+  let conControl = 0, unidades = 0, valor = 0;
+  state.productos.forEach(p => {
+    if (p.aplicar_stock){
+      conControl++;
+      const stock = Number(p.stock ?? 0);
+      unidades += stock;
+      valor += stock * Number(p.precio || 0);
+    }
+  });
+  return { total, conControl, unidades, valor };
+}
+
+function calcularDemandaInventario(productos, pedidos, fechaActual = new Date()){
+  const desde = new Date(fechaActual.getFullYear(), fechaActual.getMonth(), fechaActual.getDate() - 29);
+  const desde90Dias = new Date(fechaActual.getFullYear(), fechaActual.getMonth(), fechaActual.getDate() - 89);
+  const metricas = new Map((productos || []).map(producto => [String(producto.id), { unidades: 0, unidades90Dias: 0, pedidos: 0 }]));
+  (pedidos || []).forEach(pedido => {
+    const fecha = parseFechaPedidoLocal(getPedidoFecha(pedido));
+    if (!fecha || fecha < desde90Dias || fecha > fechaActual) return;
+    const reciente = fecha >= desde;
+    const compras = Array.isArray(pedido.compras) ? pedido.compras : [];
+    const contados = new Set();
+    compras.forEach(item => {
+      const producto = (productos || []).find(p => compraCoincideConProducto(item, p));
+      if (!producto) return;
+      const clave = String(producto.id);
+      const cantidad = Number(item.quantity ?? item.cantidad ?? 1) || 0;
+      const metrica = metricas.get(clave);
+      if (!metrica || cantidad <= 0) return;
+      metrica.unidades90Dias += cantidad;
+      if (reciente){
+        metrica.unidades += cantidad;
+        contados.add(clave);
+      }
+    });
+    contados.forEach(clave => metricas.get(clave).pedidos++);
+  });
+  metricas.forEach(metrica => {
+    metrica.promedioDiario = metrica.unidades / 30;
+  });
+  return metricas;
+}
+
+function prioridadInventario(producto, metrica = {}){
+  const stock = Number(producto.stock ?? 0);
+  const demanda = Number(metrica.promedioDiario || 0);
+  const plazo = Number(producto.plazo_reposicion_dias || 0);
+  const reserva = Number(producto.stock_seguridad_dias || 0);
+  if (producto.aplicar_stock && stock <= 0 && metrica.unidades90Dias > 0) return 0;
+  if (producto.aplicar_stock && demanda > 0 && plazo > 0 && stock <= demanda * (plazo + reserva)) return 1;
+  if (estadoStockProducto(producto) === 'sin') return 2;
+  if (estadoStockProducto(producto) === 'bajo') return 3;
+  if (producto.aplicar_stock && stock > 0 && metrica.unidades === 0) return 4;
+  return 5;
+}
+
+function renderInventarioInsights(){
+  const contenedor = document.getElementById('inv-insights');
+  if (!contenedor) return;
+  const señales = state.productos.map(producto => {
+    const metrica = state.inventarioDemanda.get(String(producto.id)) || { unidades: 0, unidades90Dias: 0, pedidos: 0, promedioDiario: 0 };
+    const stock = Number(producto.stock ?? 0);
+    const autonomia = metrica.promedioDiario > 0 ? stock / metrica.promedioDiario : null;
+    const plazo = Number(producto.plazo_reposicion_dias || 0);
+    const reserva = Number(producto.stock_seguridad_dias || 0);
+    const sugerido = metrica.promedioDiario > 0 && plazo > 0
+      ? Math.max(0, Math.ceil(metrica.promedioDiario * (plazo + reserva) - stock))
+      : null;
+    return { producto, metrica, autonomia, sugerido, prioridad: prioridadInventario(producto, metrica) };
+  }).filter(item => item.prioridad < 5)
+    .sort((a, b) => a.prioridad - b.prioridad || (a.autonomia ?? Infinity) - (b.autonomia ?? Infinity));
+  const totalSeñales = señales.length;
+  setText('inv-insights-count', totalSeñales ? `${totalSeñales} alerta${totalSeñales === 1 ? '' : 's'}` : 'Sin alertas');
+  const señalesVisibles = señales.slice(0, 12);
+
+  if (state.inventarioPedidosError){
+    contenedor.innerHTML = `<p class="hint warn">No se pudo cargar el historial de pedidos. Se muestran las señales de stock disponibles, sin estimar demanda.</p>`;
+  }
+  if (!señalesVisibles.length){
+    contenedor.innerHTML = state.inventarioPedidosError
+      ? `<p class="hint warn">No se pudo cargar el historial de pedidos para calcular reposición.</p>`
+      : `<p class="hint">Sin alertas de reposición o productos sin movimiento en los últimos 30 días.</p>`;
+    return;
+  }
+  contenedor.innerHTML = señalesVisibles.map(({ producto, metrica, autonomia, sugerido, prioridad }) => {
+    let estado = 'Sin movimiento';
+    let detalle = `${producto.stock ?? 0} en stock · ${metrica.unidades} und. pedidas en 30 días`;
+    let clase = 'info';
+    if (prioridad === 0){ estado = 'Agotado con demanda'; clase = 'danger'; if (!metrica.unidades) detalle += ` · ${metrica.unidades90Dias} und. en 90 días`; }
+    else if (prioridad === 1){ estado = 'Reponer pronto'; clase = 'warn'; }
+    else if (prioridad === 2){ estado = 'Sin stock'; clase = 'danger'; }
+    else if (prioridad === 3){ estado = 'Stock bajo'; clase = 'warn'; }
+    if (autonomia !== null) detalle += ` · autonomía ≈ ${autonomia.toFixed(1)} días`;
+    if (sugerido !== null) detalle += sugerido > 0 ? ` · sugerido: ${sugerido} und.` : ' · stock cubre plazo y reserva';
+    if (producto.aplicar_stock && !Number(producto.plazo_reposicion_dias || 0) && metrica.unidades > 0) detalle += ' · configura plazo de reposición';
+    return `<div class="mini-row inventory-insight-row"><span class="k">${escapeHtml(producto.nombre)} <span class="pill pill-${clase}">${estado}</span> · ${escapeHtml(detalle)}</span><button class="btn btn-ghost btn-small" type="button" data-inv-insight-edit="${escapeHtml(String(producto.id))}">Ver producto</button></div>`;
+  }).join('');
+}
+
+function renderInventarioStats(){
+  const cont = document.getElementById('inv-stats');
+  if (!cont) return;
+  const { total, conControl, unidades, valor } = calcularStatsInventario();
+  cont.innerHTML = `
+    <div class="stat-chip">
+      <span class="stat-chip-ico"><i class="fa-solid fa-boxes-stacked"></i></span>
+      <div class="stat-chip-body">
+        <span class="stat-chip-label">Productos</span>
+        <strong class="stat-chip-value">${total}</strong>
+      </div>
+    </div>
+    <div class="stat-chip">
+      <span class="stat-chip-ico stat-chip-ico-teal"><i class="fa-solid fa-shield-halved"></i></span>
+      <div class="stat-chip-body">
+        <span class="stat-chip-label">Con control de stock</span>
+        <strong class="stat-chip-value">${conControl}</strong>
+      </div>
+    </div>
+    <div class="stat-chip">
+      <span class="stat-chip-ico stat-chip-ico-blue"><i class="fa-solid fa-cubes"></i></span>
+      <div class="stat-chip-body">
+        <span class="stat-chip-label">Unidades en stock</span>
+        <strong class="stat-chip-value">${unidades}</strong>
+      </div>
+    </div>
+    <div class="stat-chip">
+      <span class="stat-chip-ico stat-chip-ico-accent"><i class="fa-solid fa-sack-dollar"></i></span>
+      <div class="stat-chip-body">
+        <span class="stat-chip-label" title="Stock actual multiplicado por precio de venta; no es costo ni ganancia">Valor potencial a precio de venta</span>
+        <strong class="stat-chip-value">$${valor.toFixed(2)}</strong>
+      </div>
+    </div>`;
+}
+
+function actualizarBadgeInventario(){
+  const { sin } = contarProductosPorStock();
+  const badge = document.getElementById('badge-inventario');
+  if (badge) badge.textContent = sin;
+}
+
+function renderProductos(){
+  const term = normalizeText(document.getElementById('inv-search').value.trim());
+  const grid = document.getElementById('inv-grid');
+
+  const conEstado = state.productos.map(p => ({ p, estado: estadoStockProducto(p) }));
+  const { bajo, sin } = contarProductosPorStock();
+  const conControl = state.productos.filter(p => p.aplicar_stock).length;
+  setText('inv-count-todos', state.productos.length);
+  setText('inv-count-bajo', bajo);
+  setText('inv-count-sin', sin);
+  setText('inv-count-control', conControl);
+  actualizarBadgeInventario();
+  renderInventarioStats();
+
+  let filtrados = conEstado;
+  if (state.invTab === 'bajo') filtrados = conEstado.filter(x => x.estado === 'bajo');
+  if (state.invTab === 'sin') filtrados = conEstado.filter(x => x.estado === 'sin');
+  if (state.invTab === 'control') filtrados = conEstado.filter(x => x.p.aplicar_stock);
+
+  const listBase = filtrados
+    .map(x => x.p)
+    .filter(p => !term || normalizeText(p.nombre).includes(term));
+  state.inventarioDemanda = calcularDemandaInventario(state.productos, state.inventarioPedidos);
+  const sortMode = document.getElementById('inv-sort')?.value || state.inventarioOrden;
+  const list = listBase.sort((a, b) => {
+    const ma = state.inventarioDemanda.get(String(a.id)) || { unidades: 0, promedioDiario: 0 };
+    const mb = state.inventarioDemanda.get(String(b.id)) || { unidades: 0, promedioDiario: 0 };
+    if (sortMode === 'nombre') return String(a.nombre).localeCompare(String(b.nombre), 'es', { sensitivity: 'base' });
+    if (sortMode === 'stock_asc') return Number(a.stock || 0) - Number(b.stock || 0);
+    if (sortMode === 'stock_desc') return Number(b.stock || 0) - Number(a.stock || 0);
+    if (sortMode === 'ventas_desc') return mb.unidades - ma.unidades;
+    const urgencia = prioridadInventario(a, ma) - prioridadInventario(b, mb);
+    if (urgencia) return urgencia;
+    const diasA = ma.promedioDiario > 0 ? Number(a.stock || 0) / ma.promedioDiario : Infinity;
+    const diasB = mb.promedioDiario > 0 ? Number(b.stock || 0) / mb.promedioDiario : Infinity;
+    return diasA - diasB;
+  });
+  renderInventarioInsights();
+
+  grid.hidden = false;
+  grid.classList.toggle('inventory-grid-table-mode', state.inventarioVista === 'tabla');
+  document.querySelectorAll('[data-inv-view]').forEach(button => {
+    button.classList.toggle('active', button.dataset.invView === state.inventarioVista);
+    button.setAttribute('aria-pressed', String(button.dataset.invView === state.inventarioVista));
+  });
+
+  // Construimos el HTML en un solo paso para minimizar reflows.
+  const html = list.map(p => {
+    const imgUrl = cloudinaryUrl((p.imagenes || [])[0], 'products', 'thumb');
+    const estado = estadoStockProducto(p);
+    const available = p.disponibilidad !== false;
+    const stockPill = estado === 'sin' ? `<span class="pill pill-danger">⚠ Sin stock</span>` : estado === 'bajo' ? `<span class="pill pill-warn">⏳ Stock bajo</span>` : '';
+    const controlPill = p.aplicar_stock ? `<span class="pill pill-control-on">✓ Control stock</span>` : `<span class="pill pill-control-off">— Sin control</span>`;
+    const minCompra = Math.max(1, Number(p.cantidad_minima ?? 1) || 1);
+    const demanda = state.inventarioDemanda.get(String(p.id)) || { unidades: 0, pedidos: 0, promedioDiario: 0 };
+    const autonomia = demanda.promedioDiario > 0 ? Number(p.stock || 0) / demanda.promedioDiario : null;
+    const sugerido = demanda.promedioDiario > 0 && Number(p.plazo_reposicion_dias || 0) > 0
+      ? Math.max(0, Math.ceil(demanda.promedioDiario * (Number(p.plazo_reposicion_dias) + Number(p.stock_seguridad_dias || 0)) - Number(p.stock || 0)))
+      : null;
+    const necesitaRevisarActivacion = !available && Number(p.stock || 0) > 0;
+    const alertaReactivar = necesitaRevisarActivacion
+      ? `<span class="pill pill-alert" title="Se desactivó automáticamente por falta de stock y ya tiene stock repuesto. Ábrelo y guárdalo para reactivarlo.">⚠ Repuesto, sin activar</span>`
+      : '';
+    const card = `
+      <article class="product-card${estado === 'bajo' ? ' stock-bajo' : estado === 'sin' ? ' stock-sin' : ''}${p.aplicar_stock ? ' stock-control-on' : ' stock-control-off'}">
+        <div class="product-card-img">
+          ${imgUrl ? `<img class="product-thumb" src="${imgUrl}" alt="${escapeHtml(p.nombre)}" loading="lazy" decoding="async">` : `<div class="thumb-placeholder"><i class="fa-solid fa-box-open"></i></div>`}
+          ${imgUrl ? `<div class="image-meta">Cargando...</div>` : ''}
+          ${imgUrl ? `<button class="img-detail-btn" title="Ver detalle de imagen" aria-label="Ver detalle de imagen" data-img-detail="${p.id}"><i class="fa-solid fa-magnifying-glass"></i></button>` : ''}
+        </div>
+        <div class="product-card-body">
+          <div class="product-card-title">
+            <div>
+              <h3>${escapeHtml(p.nombre)}</h3>
+              <p class="product-card-category">${escapeHtml(p.categoria || '—')}</p>
+            </div>
+            <div class="product-card-statuses">
+              <span class="pill ${available ? 'pill-yes' : 'pill-no'}">${available ? '✓ Disponible' : '— Oculto'}</span>
+              ${controlPill}
+              ${alertaReactivar}
+            </div>
+          </div>
+          <div class="product-card-meta">
+            <div><span>Precio</span><strong>$${Number(p.precio || 0).toFixed(2)}</strong></div>
+            <div><span>Stock</span><strong>${p.stock ?? 0} ${stockPill}</strong></div>
+            <div><span>Pedido 30 días</span><strong>${demanda.unidades} und.</strong></div>
+            <div><span>Autonomía</span><strong>${autonomia === null ? 'Sin ventas' : `≈ ${autonomia.toFixed(1)} días`}</strong></div>
+            <div><span>Oferta</span><strong>${p.oferta ? `-${p.descuento || 0}%` : 'No'}</strong></div>
+            <div><span>Más vendido</span><strong>${p.mas_vendido ? 'Sí' : 'No'}</strong></div>
+            <div><span>Mín. compra</span><strong>${minCompra > 1 ? minCompra : '—'}</strong></div>
+          </div>
+          <div class="product-card-dates">
+            <span><i class="fa-solid fa-plus"></i> ${formatFechaCorta(p.fecha_creacion)}</span>
+            <span><i class="fa-solid fa-pen"></i> ${formatFechaCorta(p.fecha_actualizacion)}</span>
+          </div>
+          <div class="product-card-actions">
+            <button class="btn btn-ghost btn-small" data-ventas="${p.id}">Ventas</button>
+            <button class="btn btn-ghost btn-small" data-edit="${p.id}">Editar</button>
+            <button class="btn btn-danger btn-small" data-del="${p.id}">Eliminar</button>
+          </div>
+        </div>
+      </article>`;
+    const row = `<tr>
+      <td>${escapeHtml(p.nombre)}</td><td>${escapeHtml(p.categoria || '—')}</td><td>${p.stock ?? 0}</td>
+      <td>${demanda.unidades}</td><td>${demanda.promedioDiario.toFixed(2)} und./día</td>
+      <td>${autonomia === null ? 'Sin ventas' : `${autonomia.toFixed(1)} días`}</td>
+      <td>${sugerido === null ? 'Configura plazo' : `${sugerido} und.`}</td>
+      <td>$${Number(p.precio || 0).toFixed(2)}</td>
+      <td><div class="row-actions"><button class="btn btn-ghost btn-small" data-ventas="${escapeHtml(String(p.id))}">Ventas</button><button class="btn btn-ghost btn-small" data-edit="${escapeHtml(String(p.id))}">Editar</button><button class="btn btn-danger btn-small" data-del="${escapeHtml(String(p.id))}">Eliminar</button></div></td>
+    </tr>`;
+    return state.inventarioVista === 'tabla' ? row : card;
+  }).join('');
+
+  if (state.inventarioVista === 'tabla'){
+    grid.innerHTML = `<table class="inventory-table"><thead><tr><th>Producto</th><th>Categoría</th><th>Stock</th><th>Pedido 30 días</th><th>Salida diaria</th><th>Autonomía</th><th>Reponer</th><th>Precio</th><th>Acciones</th></tr></thead><tbody>${html}</tbody></table>`;
+  } else {
+    grid.innerHTML = html;
+  }
+  document.getElementById('inv-empty').hidden = list.length !== 0;
+
+  // Mejora de imágenes: carga diferida y decoding async para mejorar FPS.
+  grid.querySelectorAll('img.product-thumb').forEach(imgEl => {
+    imgEl.loading = 'lazy';
+    imgEl.decoding = 'async';
+    const card = imgEl.closest('.product-card');
+    const labelEl = card ? card.querySelector('.image-meta') : null;
+    if (labelEl) {
+      const updateMeta = () => setImageMetaInfo(imgEl, labelEl);
+      if (imgEl.complete && imgEl.naturalWidth) updateMeta();
+      else {
+        imgEl.addEventListener('load', updateMeta, { once: true });
+        imgEl.addEventListener('error', () => { labelEl.textContent = 'Imagen no disponible'; }, { once: true });
+      }
+    }
+  });
+
+  // Event delegation: un único handler para editar/eliminar/ver imagen.
+  grid.onclick = function(e){
+    const ventas = e.target.closest && e.target.closest('[data-ventas]');
+    if (ventas) return abrirModalVentasProducto(ventas.dataset.ventas);
+    const edit = e.target.closest && e.target.closest('[data-edit]');
+    if (edit) return openProductoModal(edit.dataset.edit);
+    const del = e.target.closest && e.target.closest('[data-del]');
+    if (del) return deleteProducto(del.dataset.del);
+    const imgDetail = e.target.closest && e.target.closest('[data-img-detail]');
+    if (imgDetail){
+      e.stopPropagation();
+      const id = imgDetail.dataset.imgDetail;
+      const prod = state.productos.find(x => x.id === id);
+      if (prod) showImageDetail(prod.imagenes || [], 'products', 0);
+    }
+  };
+
+  requestAnimationFrame(() => updateSegTabsFade(document.getElementById('inv-tabs')));
+}
+
+document.getElementById('inv-search').addEventListener('input', debounce(renderProductos, 150));
+document.getElementById('inv-new').addEventListener('click', () => openProductoModal(null));
+document.querySelectorAll('[data-inv-view]').forEach(button => {
+  button.addEventListener('click', () => {
+    state.inventarioVista = button.dataset.invView;
+    localStorage.setItem('panel_inventario_vista', state.inventarioVista);
+    renderProductos();
+  });
+});
+document.getElementById('inv-sort')?.addEventListener('change', event => {
+  state.inventarioOrden = event.target.value;
+  localStorage.setItem('panel_inventario_orden', state.inventarioOrden);
+  renderProductos();
+});
+document.getElementById('inv-export-csv')?.addEventListener('click', () => {
+  const headers = ['Producto', 'Categoría', 'Stock', 'Control de stock', 'Unidades pedidas 30 días', 'Pedidos 30 días', 'Salida diaria promedio', 'Autonomía estimada días', 'Plazo reposición días', 'Reserva días', 'Unidades sugeridas para reponer', 'Precio de venta', 'Valor potencial del stock'];
+  const rows = state.productos.map(producto => {
+    const demanda = state.inventarioDemanda.get(String(producto.id)) || { unidades: 0, pedidos: 0, promedioDiario: 0 };
+    const autonomia = demanda.promedioDiario > 0 ? Number(producto.stock || 0) / demanda.promedioDiario : '';
+    const sugerido = demanda.promedioDiario > 0 && Number(producto.plazo_reposicion_dias || 0) > 0
+      ? Math.max(0, Math.ceil(demanda.promedioDiario * (Number(producto.plazo_reposicion_dias) + Number(producto.stock_seguridad_dias || 0)) - Number(producto.stock || 0)))
+      : '';
+    return [producto.nombre, producto.categoria, producto.stock ?? 0, producto.aplicar_stock ? 'Sí' : 'No', demanda.unidades, demanda.pedidos, demanda.promedioDiario.toFixed(2), autonomia === '' ? '' : autonomia.toFixed(1), producto.plazo_reposicion_dias ?? 0, producto.stock_seguridad_dias ?? 0, sugerido, Number(producto.precio || 0).toFixed(2), (Number(producto.stock || 0) * Number(producto.precio || 0)).toFixed(2)];
+  });
+  exportarCSV(headers, rows, `inventario-buquenque-${new Date().toISOString().slice(0, 10)}.csv`);
+});
+document.getElementById('inv-insights')?.addEventListener('click', event => {
+  const button = event.target.closest('[data-inv-insight-edit]');
+  if (button) openProductoModal(button.dataset.invInsightEdit);
+});
+document.getElementById('inv-sort').value = state.inventarioOrden;
+
+document.querySelectorAll('#inv-tabs [data-itab]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    state.invTab = btn.dataset.itab;
+    document.querySelectorAll('#inv-tabs [data-itab]').forEach(b => b.classList.toggle('active', b === btn));
+    renderProductos();
+  });
+});
+
+const invUmbralInput = document.getElementById('inv-umbral');
+invUmbralInput.value = state.stockUmbral;
+invUmbralInput.addEventListener('change', () => {
+  const val = Math.max(0, Number(invUmbralInput.value || 0));
+  state.stockUmbral = val;
+  localStorage.setItem('panel_stock_umbral', String(val));
+  renderProductos();
+});
+
+function openProductoModal(id){
+  const p = id ? state.productos.find(x => x.id === id) : null;
+  setText('prod-modal-title', p ? 'Editar producto' : 'Nuevo producto');
+  document.getElementById('prod-id').value = p ? (p.id ?? '') : '';
+  document.getElementById('prod-nombre').value = p ? (p.nombre ?? '') : '';
+  document.getElementById('prod-categoria').value = p ? (p.categoria ?? '') : '';
+  if (p && p.categoria){
+    const select = document.getElementById('prod-categoria');
+    if (select && !Array.from(select.options).some(opt => opt.value === p.categoria)){
+      select.insertAdjacentHTML('beforeend', `<option value="${escapeHtml(p.categoria)}">${escapeHtml(p.categoria)}</option>`);
+    }
+  }
+  document.getElementById('prod-descripcion').value = p ? (p.descripcion ?? '') : '';
+  document.getElementById('prod-precio').value = p ? (p.precio ?? 0) : '';
+  document.getElementById('prod-stock').value = p ? (p.stock ?? 0) : '';
+  document.getElementById('prod-aplicar-stock').checked = p ? !!p.aplicar_stock : false;
+  document.getElementById('prod-cantidad-minima').value = p ? Math.max(1, Number(p.cantidad_minima ?? 1) || 1) : 1;
+  document.getElementById('prod-lead-days').value = p ? Math.max(0, Number(p.plazo_reposicion_dias ?? 0) || 0) : 0;
+  document.getElementById('prod-safety-days').value = p ? Math.max(0, Number(p.stock_seguridad_dias ?? 0) || 0) : 0;
+  document.getElementById('prod-oferta').checked = p ? !!p.oferta : false;
+  const productoDisponible = p
+    ? (p.disponibilidad !== undefined ? p.disponibilidad !== false : p.disponible !== false)
+    : true;
+  const stockActualNum = p ? Number(p.stock ?? 0) : 0;
+  const reactivadoAuto = p && !productoDisponible && stockActualNum > 0;
+  document.getElementById('prod-activo').checked = reactivadoAuto ? true : productoDisponible;
+  const activoHint = document.getElementById('prod-activo-hint');
+  if (activoHint){
+    if (reactivadoAuto){
+      activoHint.hidden = false;
+      activoHint.textContent = 'Este producto se desactivó automáticamente por quedarse sin stock, pero ya tiene stock repuesto. Se marcó "Disponible" de nuevo; guarda para confirmarlo (o desmárcalo si quieres mantenerlo oculto).';
+      activoHint.className = 'hint warn';
+    } else if (p && p.desactivado_por_stock && !productoDisponible){
+      activoHint.hidden = false;
+      activoHint.textContent = 'Este producto se desactivó automáticamente porque se quedó sin stock. Repón el stock y márcalo como disponible cuando quieras que vuelva a verse en la tienda.';
+      activoHint.className = 'hint warn';
+    } else {
+      activoHint.hidden = true;
+      activoHint.textContent = '';
+    }
+  }
+  document.getElementById('prod-mas-vendido').checked = p ? !!p.mas_vendido : false;
+  document.getElementById('prod-delete').hidden = !p;
+  const infoEntry = p ? state.infoMap[p.id] : null;
+  document.getElementById('prod-info').value = infoEntry ? (infoEntry.info || '') : '';
+
+  // Precio con descuento: se reconstruye a partir de precio + descuento(%)
+  // guardados, para que el usuario vuelva a ver el precio final en vez del
+  // porcentaje crudo.
+  const precioOferta = (p && p.oferta && p.precio && p.descuento)
+    ? (Number(p.precio) * (1 - Number(p.descuento) / 100)).toFixed(2)
+    : '';
+  document.getElementById('prod-precio-oferta').value = precioOferta;
+  recalcProdOferta();
+
+  state.prodImages = p ? [...(p.imagenes || [])] : [];
+  renderImageGrid('prod-image-grid', state.prodImages);
+
+  openModal('modal-producto');
+}
+
+function renderImageGrid(gridId, images, folder = 'products'){
+  const grid = document.getElementById(gridId);
+  grid.innerHTML = '';
+  images.forEach((img, idx) => {
+    const url = cloudinaryUrl(img, folder, 'thumb');
+    const tile = document.createElement('div');
+    tile.className = 'image-tile';
+    if (url) {
+      const imgEl = document.createElement('img');
+      imgEl.src = url;
+      imgEl.alt = 'Imagen';
+      imgEl.loading = 'lazy';
+      imgEl.decoding = 'async';
+      imgEl.className = 'clickable-image';
+      imgEl.addEventListener('click', () => showImageDetail(images, folder, idx));
+      imgEl.addEventListener('error', () => {
+        imgEl.replaceWith(Object.assign(document.createElement('div'), { className: 'thumb-placeholder', textContent: '⚠' }));
+      });
+      tile.appendChild(imgEl);
+    } else {
+      tile.innerHTML = `<div class="thumb-placeholder">🖼</div>`;
+    }
+    const rm = document.createElement('button');
+    rm.className = 'rm';
+    rm.dataset.idx = String(idx);
+    rm.textContent = '✕';
+    tile.appendChild(rm);
+    grid.appendChild(tile);
+  });
+  grid.querySelectorAll('.rm').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const arr = gridId === 'prod-image-grid' ? state.prodImages : state.packImages;
+      arr.splice(Number(btn.dataset.idx), 1);
+      renderImageGrid(gridId, arr, gridId === 'prod-image-grid' ? 'products' : 'packs');
+    });
+  });
+}
+
+document.getElementById('prod-file-input').addEventListener('change', async (e) => {
+  const hint = document.getElementById('prod-image-hint');
+  hint.textContent = 'Procesando imagen(es)...';
+  try{
+    for (const file of e.target.files){
+      const dataUrl = await compressImage(file);
+      state.prodImages.push(dataUrl);
+    }
+    renderImageGrid('prod-image-grid', state.prodImages);
+    hint.textContent = '';
+  }catch(err){
+    hint.textContent = 'No se pudo procesar la imagen: ' + err.message;
+    hint.className = 'hint err';
+  }
+  e.target.value = '';
+});
+
+document.getElementById('prod-save').addEventListener('click', async () => {
+  const id = document.getElementById('prod-id').value;
+  const oferta = document.getElementById('prod-oferta').checked;
+  const descuento = Number(document.getElementById('prod-descuento').value || 0);
+  if (oferta && descuento <= 0){
+    showToast('Define un precio con descuento válido antes de guardar.', true);
+    return;
+  }
+  const disponibilidadValue = document.getElementById('prod-activo').checked;
+  const payload = {
+    nombre: document.getElementById('prod-nombre').value.trim(),
+    categoria: document.getElementById('prod-categoria').value.trim(),
+    descripcion: document.getElementById('prod-descripcion').value.trim(),
+    precio: Number(document.getElementById('prod-precio').value || 0),
+    stock: Number(document.getElementById('prod-stock').value || 0),
+    cantidad_minima: Math.max(1, Math.floor(Number(document.getElementById('prod-cantidad-minima').value || 1)) || 1),
+    plazo_reposicion_dias: Math.min(365, Math.max(0, parseInt(document.getElementById('prod-lead-days').value, 10) || 0)),
+    stock_seguridad_dias: Math.min(365, Math.max(0, parseInt(document.getElementById('prod-safety-days').value, 10) || 0)),
+    aplicar_stock: document.getElementById('prod-aplicar-stock').checked,
+    descuento,
+    oferta,
+    disponible: disponibilidadValue,
+    disponibilidad: disponibilidadValue,
+    activo: disponibilidadValue,
+    mas_vendido: document.getElementById('prod-mas-vendido').checked,
+    imagenes: state.prodImages
+  };
+  if (!payload.nombre){
+    showToast('El nombre es obligatorio.', true);
+    return;
+  }
+  const infoTexto = document.getElementById('prod-info').value.trim();
+  try{
+    let productoId = id;
+    if (id){
+      await apiFetch(`/api/products/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
+      showToast('Producto actualizado.');
+    } else {
+      const creado = await apiFetch('/api/products', { method: 'POST', body: JSON.stringify(payload) });
+      productoId = creado && creado.product ? creado.product.id : null;
+      showToast('Producto creado.');
+    }
+    if (productoId){
+      try{
+        if (infoTexto){
+          await apiFetch(`/api/info/${productoId}`, { method: 'PUT', body: JSON.stringify({ info: infoTexto }) });
+        } else if (id){
+          await apiFetch(`/api/info/${productoId}`, { method: 'DELETE' });
+        }
+      }catch(infoErr){ showToast('Producto guardado, pero falló la nota especial: ' + infoErr.message, true); }
+    }
+    closeModal('modal-producto');
+    loadProductos(true);
+  }catch(e){ showToast('Error guardando producto: ' + e.message, true); }
+});
+
+document.getElementById('prod-delete').addEventListener('click', async () => {
+  const id = document.getElementById('prod-id').value;
+  if (!id) return;
+  deleteProducto(id);
+  closeModal('modal-producto');
+});
+
+async function deleteProducto(id){
+  if (!confirm('¿Eliminar este producto? También se borrarán sus imágenes de Cloudinary.')) return;
+  try{
+    await apiFetch(`/api/products/${id}`, { method: 'DELETE' });
+    apiFetch(`/api/info/${id}`, { method: 'DELETE' }).catch(() => {});
+    showToast('Producto eliminado.');
+    loadProductos(true);
+  }catch(e){ showToast('Error eliminando: ' + e.message, true); }
+}
+
+/* ================================================================
+   PACKS  ->  /api/packs
+   ================================================================ */
+
+async function loadPacks(){
+  try{
+    const packsData = await apiFetch('/api/packs');
+    state.packs = packsData.packs || [];
+    renderPacks();
+  }catch(e){ showToast('Error cargando packs: ' + e.message, true); }
+}
+
+function renderPacks(){
+  const term = normalizeText(document.getElementById('pack-search').value.trim());
+  const grid = document.getElementById('pack-grid');
+
+  const disponiblesCount = state.packs.filter(p => p.disponible !== false).length;
+  const ofertaCount = state.packs.filter(p => p.oferta).length;
+  setText('pack-count-todos', state.packs.length);
+  setText('pack-count-disponibles', disponiblesCount);
+  setText('pack-count-oferta', ofertaCount);
+
+  let filtrados = state.packs;
+  if (state.packTab === 'disponibles') filtrados = filtrados.filter(p => p.disponible !== false);
+  if (state.packTab === 'oferta') filtrados = filtrados.filter(p => p.oferta);
+
+  const list = filtrados.filter(p => !term || normalizeText(p.nombre).includes(term));
+
+  grid.innerHTML = '';
+  document.getElementById('pack-empty').hidden = list.length !== 0;
+
+  list.forEach(p => {
+    const imgUrl = cloudinaryUrl((p.imagenes || [])[0] || p.imagen, 'packs', 'thumb');
+    const caracteristicas = Array.isArray(p.caracteristicas)
+      ? p.caracteristicas
+      : (p.caracteristicas ? String(p.caracteristicas).split(/\r?\n/) : []);
+    const caracteristicasHtml = caracteristicas.length
+      ? `<ul class="pack-features">${caracteristicas.slice(0, 5).map(item => `<li><i class="fa-solid fa-check"></i>${escapeHtml(item)}</li>`).join('')}${caracteristicas.length > 5 ? `<li class="pack-features-more">+${caracteristicas.length - 5} más</li>` : ''}</ul>`
+      : '<p class="pack-no-features">Sin características listadas.</p>';
+    const precio = Number(p.precio || 0);
+    const descuento = Number(p.descuento || 0);
+    const precioFinal = p.oferta && descuento > 0 ? precio * (1 - descuento / 100) : precio;
+    const disponible = p.disponible !== false;
+
+    const card = document.createElement('article');
+    card.className = 'pack-card' + (p.oferta ? ' pack-oferta' : '') + (!disponible ? ' pack-oculto' : '');
+    card.innerHTML = `
+      <div class="pack-card-img">
+        ${imgUrl ? `<img class="pack-thumb" src="${imgUrl}" alt="${escapeHtml(p.nombre)}" loading="lazy" decoding="async">` : `<div class="thumb-placeholder"><i class="fa-solid fa-gift"></i></div>`}
+        ${imgUrl ? `<div class="image-meta">Cargando...</div>` : ''}
+        ${imgUrl ? `<button class="img-detail-btn" title="Ver detalle de imagen" aria-label="Ver detalle de imagen" data-pack-img-detail="${p.id}"><i class="fa-solid fa-magnifying-glass"></i></button>` : ''}
+        <div class="pack-badges">
+          ${p.oferta ? `<span class="pack-badge pack-badge-oferta"><i class="fa-solid fa-tag"></i> -${descuento}%</span>` : ''}
+          ${p.top ? `<span class="pack-badge pack-badge-top"><i class="fa-solid fa-star"></i> Top</span>` : ''}
+          ${p.nuevo ? `<span class="pack-badge pack-badge-nuevo">Nuevo</span>` : ''}
+        </div>
+      </div>
+      <div class="pack-card-body">
+        <div class="pack-card-title">
+          <div>
+            <h3>${escapeHtml(p.nombre)}</h3>
+            <p class="pack-card-category">${escapeHtml(p.categoria || 'Pack')}</p>
+          </div>
+          <span class="pill ${disponible ? 'pill-yes' : 'pill-no'}">${disponible ? '✓ Disponible' : '— Oculto'}</span>
+        </div>
+        ${p.descripcion ? `<p class="pack-card-desc">${escapeHtml(p.descripcion)}</p>` : ''}
+        <div class="pack-card-price">
+          ${p.oferta && descuento > 0
+            ? `<span class="price-old">$${precio.toFixed(2)}</span><span class="price-final price-final-oferta">$${precioFinal.toFixed(2)}</span>`
+            : `<span class="price-final">$${precio.toFixed(2)}</span>`}
+        </div>
+        ${caracteristicasHtml}
+        <div class="pack-card-dates">
+          <span><i class="fa-solid fa-plus"></i> ${formatFechaCorta(p.fecha_creacion)}</span>
+          <span><i class="fa-solid fa-pen"></i> ${formatFechaCorta(p.fecha_actualizacion)}</span>
+        </div>
+        <div class="pack-card-actions">
+          <button class="btn btn-ghost btn-small" data-edit="${p.id}"><i class="fa-solid fa-pen"></i> Editar</button>
+          <button class="btn btn-danger btn-small" data-del="${p.id}"><i class="fa-solid fa-trash"></i> Eliminar</button>
+        </div>
+      </div>`;
+    grid.appendChild(card);
+
+    const thumbImg = card.querySelector('img.pack-thumb');
+    const thumbLabel = card.querySelector('.image-meta');
+    if (thumbImg && thumbLabel) {
+      const updateMeta = () => setImageMetaInfo(thumbImg, thumbLabel);
+      thumbImg.addEventListener('load', updateMeta);
+      thumbImg.addEventListener('error', () => { thumbLabel.textContent = 'Imagen no disponible'; });
+      if (thumbImg.complete && thumbImg.naturalWidth) {
+        updateMeta();
+      }
+    }
+    const packDetailBtn = card.querySelector('[data-pack-img-detail]');
+    if (packDetailBtn) {
+      packDetailBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const packSources = (p.imagenes && p.imagenes.length) ? p.imagenes : (p.imagen ? [p.imagen] : []);
+        showImageDetail(packSources, 'packs', 0);
+      });
+    }
+  });
+
+  grid.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => openPackModal(b.dataset.edit)));
+  grid.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', () => deletePack(b.dataset.del)));
+  requestAnimationFrame(() => updateSegTabsFade(document.getElementById('pack-tabs')));
+}
+
+document.getElementById('pack-search').addEventListener('input', debounce(renderPacks, 150));
+document.getElementById('pack-new').addEventListener('click', () => openPackModal(null));
+
+document.querySelectorAll('#pack-tabs [data-ptab]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    state.packTab = btn.dataset.ptab;
+    document.querySelectorAll('#pack-tabs [data-ptab]').forEach(b => b.classList.toggle('active', b === btn));
+    renderPacks();
+  });
+});
+
+function openPackModal(id){
+  const p = id ? state.packs.find(x => x.id === id) : null;
+  setText('pack-modal-title', p ? 'Editar pack' : 'Nuevo pack');
+  document.getElementById('pack-id').value = p ? (p.id ?? '') : '';
+  document.getElementById('pack-nombre').value = p ? (p.nombre ?? '') : '';
+  document.getElementById('pack-categoria').value = p ? (p.categoria ?? 'Pack') : 'Pack';
+  document.getElementById('pack-descripcion').value = p ? (p.descripcion ?? '') : '';
+  document.getElementById('pack-precio').value = p ? (p.precio ?? 0) : '';
+  document.getElementById('pack-oferta').checked = p ? !!p.oferta : false;
+  document.getElementById('pack-disponible').checked = p ? p.disponible !== false : true;
+  document.getElementById('pack-top').checked = p ? !!p.top : false;
+  document.getElementById('pack-nuevo').checked = p ? !!p.nuevo : false;
+  document.getElementById('pack-caracteristicas').value = p && Array.isArray(p.caracteristicas) ? p.caracteristicas.join('\n') : '';
+  document.getElementById('pack-delete').hidden = !p;
+
+  const precioOferta = (p && p.oferta && p.precio && p.descuento)
+    ? (Number(p.precio) * (1 - Number(p.descuento) / 100)).toFixed(2)
+    : '';
+  document.getElementById('pack-precio-oferta').value = precioOferta;
+  recalcPackOferta();
+
+  state.packImages = p ? [...(p.imagenes || (p.imagen ? [p.imagen] : []))] : [];
+  renderImageGrid('pack-image-grid', state.packImages, 'packs');
+
+  openModal('modal-pack');
+}
+
+document.getElementById('pack-file-input').addEventListener('change', async (e) => {
+  const hint = document.getElementById('pack-image-hint');
+  hint.textContent = 'Procesando imagen(es)...';
+  try{
+    for (const file of e.target.files){
+      const dataUrl = await compressImage(file);
+      state.packImages.push(dataUrl);
+    }
+    renderImageGrid('pack-image-grid', state.packImages, 'packs');
+    hint.textContent = '';
+  }catch(err){
+    hint.textContent = 'No se pudo procesar la imagen: ' + err.message;
+    hint.className = 'hint err';
+  }
+  e.target.value = '';
+});
+
+document.getElementById('pack-save').addEventListener('click', async () => {
+  const id = document.getElementById('pack-id').value;
+  const oferta = document.getElementById('pack-oferta').checked;
+  const descuento = Number(document.getElementById('pack-descuento').value || 0);
+  if (oferta && descuento <= 0){
+    showToast('Define un precio con descuento válido antes de guardar.', true);
+    return;
+  }
+  const caracteristicas = document.getElementById('pack-caracteristicas').value
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean);
+  const payload = {
+    nombre: document.getElementById('pack-nombre').value.trim(),
+    categoria: document.getElementById('pack-categoria').value.trim() || 'Pack',
+    descripcion: document.getElementById('pack-descripcion').value.trim(),
+    precio: Number(document.getElementById('pack-precio').value || 0),
+    descuento,
+    oferta,
+    disponible: document.getElementById('pack-disponible').checked,
+    top: document.getElementById('pack-top').checked,
+    nuevo: document.getElementById('pack-nuevo').checked,
+    caracteristicas,
+    imagenes: state.packImages,
+    imagen: state.packImages[0] || ''
+  };
+  if (!payload.nombre){
+    showToast('El nombre es obligatorio.', true);
+    return;
+  }
+  try{
+    if (id){
+      await apiFetch(`/api/packs/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
+      showToast('Pack actualizado.');
+    } else {
+      await apiFetch('/api/packs', { method: 'POST', body: JSON.stringify(payload) });
+      showToast('Pack creado.');
+    }
+    closeModal('modal-pack');
+    loadPacks();
+  }catch(e){ showToast('Error guardando pack: ' + e.message, true); }
+});
+
+document.getElementById('pack-delete').addEventListener('click', async () => {
+  const id = document.getElementById('pack-id').value;
+  if (!id) return;
+  deletePack(id);
+  closeModal('modal-pack');
+});
+
+async function deletePack(id){
+  if (!confirm('¿Eliminar este pack? También se borrarán sus imágenes de Cloudinary.')) return;
+  try{
+    await apiFetch(`/api/packs/${id}`, { method: 'DELETE' });
+    showToast('Pack eliminado.');
+    loadPacks();
+  }catch(e){ showToast('Error eliminando: ' + e.message, true); }
+}
+
+function attachOfertaCalc(prefix){
+  const oferta = document.getElementById(`${prefix}-oferta`);
+  const box = document.getElementById(`${prefix}-oferta-box`);
+  const precio = document.getElementById(`${prefix}-precio`);
+  const precioOferta = document.getElementById(`${prefix}-precio-oferta`);
+  const descuentoView = document.getElementById(`${prefix}-descuento-view`);
+  const descuentoHidden = document.getElementById(`${prefix}-descuento`);
+  const info = document.getElementById(`${prefix}-oferta-info`);
+
+  function recalc(){
+    box.hidden = !oferta.checked;
+    if (!oferta.checked){
+      descuentoHidden.value = 0;
+      descuentoView.value = '';
+      info.textContent = 'Marca "en oferta" para definir un precio con descuento.';
+      info.className = 'hint';
+      return;
+    }
+    const pNormal = Number(precio.value || 0);
+    const pOferta = Number(precioOferta.value || 0);
+    if (!pNormal){
+      descuentoHidden.value = 0;
+      descuentoView.value = '';
+      info.textContent = 'Primero define el precio normal.';
+      info.className = 'hint';
+      return;
+    }
+    if (!pOferta){
+      descuentoHidden.value = 0;
+      descuentoView.value = '';
+      info.textContent = 'Escribe el precio con descuento que quieres cobrar.';
+      info.className = 'hint';
+      return;
+    }
+    if (pOferta >= pNormal){
+      descuentoHidden.value = 0;
+      descuentoView.value = '';
+      info.textContent = 'El precio con descuento debe ser menor al precio normal.';
+      info.className = 'hint err';
+      return;
+    }
+    const pct = ((pNormal - pOferta) / pNormal) * 100;
+    descuentoHidden.value = pct.toFixed(2);
+    descuentoView.value = pct.toFixed(0) + '%';
+    info.textContent = `Ahorra $${(pNormal - pOferta).toFixed(2)} respecto al precio normal (${pct.toFixed(0)}% de descuento).`;
+    info.className = 'hint ok';
+  }
+
+  oferta.addEventListener('change', recalc);
+  precio.addEventListener('input', recalc);
+  precioOferta.addEventListener('input', recalc);
+
+  return recalc;
+}
+
+const recalcProdOferta = attachOfertaCalc('prod');
+const recalcPackOferta = attachOfertaCalc('pack');
+
+// Misma lógica que usa el backend (ordersBelongToSameUser) para decidir si
+// dos pedidos son del mismo cliente: mismo teléfono, mismo correo, o mismo id.
+function ordersBelongToSameUser(a, b){
+  if (!a || !b) return false;
+  const telA = String(a.telefono_comprador || '').trim();
+  const telB = String(b.telefono_comprador || '').trim();
+  if (telA && telB && telA === telB) return true;
+
+  const mailA = String(a.correo_comprador || '').trim().toLowerCase();
+  const mailB = String(b.correo_comprador || '').trim().toLowerCase();
+  if (mailA && mailA !== 'n/a' && mailA === mailB) return true;
+
+  const idA = a.usuarioId || a.userId || a.id_usuario;
+  const idB = b.usuarioId || b.userId || b.id_usuario;
+  if (idA && idB && String(idA) === String(idB)) return true;
+
+  return false;
+}
+
+function esClienteReincidente(pedido, historial){
+  return historial.some(item => item.id !== pedido.id && ordersBelongToSameUser(item, pedido));
+}
+
+function pedidosSearchTerm(){
+  return normalizeText(document.getElementById('pedidos-search').value.trim());
+}
+
+/* ------------------------- Búsqueda por precio -------------------------
+   El mismo buscador de texto también entiende montos: "77.20", "77,20",
+   "$77.20", "77" o "1.234,56". Sirve para localizar un pago concreto sin
+   saber contra qué nombre o teléfono se hizo. */
+
+// Convierte lo que el usuario escribió en un número, tolerando el símbolo de
+// moneda ($ 77.20), el decimal con coma (77,20) y los separadores de miles
+// (1,234.56 y 1.234,56). Devuelve null si no hay un número reconocible.
+function parseTerminoPrecio(raw){
+  let s = String(raw == null ? '' : raw).trim().toLowerCase();
+  if (!s) return null;
+
+  s = s.replace(/\b(usd|cuc|cup|pesos?|dollars?)\b/g, ' ');
+  s = s.replace(/[^0-9.,]/g, '');
+  if (!/\d/.test(s)) return null;
+
+  const punto = s.lastIndexOf('.');
+  const coma = s.lastIndexOf(',');
+
+  if (punto >= 0 && coma >= 0){
+    // "1.234,56" o "1,234.56": el separador que aparece de último es el decimal.
+    const decimal = Math.max(punto, coma);
+    s = s.slice(0, decimal).replace(/[.,]/g, '') + '.' + s.slice(decimal + 1);
+  } else if (punto >= 0 || coma >= 0){
+    const sep = punto >= 0 ? '.' : ',';
+    const partes = s.split(sep);
+    // Un solo separador con exactamente 3 dígitos detrás es de miles (1.234);
+    // con otra cantidad de dígitos es decimal (77.20 → 77.20).
+    const esMiles = partes.length > 2 || partes[1].length === 3;
+    s = esMiles ? partes.join('') : partes[0] + '.' + partes[1];
+  }
+
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Valores (en centavos) por los que un pedido puede coincidir con el monto
+// buscado. Se comparan en centavos para evitar los errores de coma flotante
+// típicos (0.1 + 0.2). Incluye la suma de los productos como alternativa al
+// total guardado: el total lo manda el cliente al crear el pedido y el backend
+// lo recalcula al editar productos, así que con uno solo se podrían escapar pagos.
+function centavosPedido(p){
+  const valores = new Set();
+
+  const total = Number(p.precio_compra_total);
+  if (Number.isFinite(total)) valores.add(Math.round(total * 100));
+
+  let suma = 0;
+  let huboItems = false;
+  (Array.isArray(p.compras) ? p.compras : []).forEach(item => {
+    if (!item) return;
+    const unit = Number(item.unitPrice ?? item.precio);
+    const cant = Number(item.quantity ?? item.cantidad);
+    if (!Number.isFinite(unit) || !Number.isFinite(cant)) return;
+    suma += unit * cant;
+    huboItems = true;
+  });
+  if (huboItems) valores.add(Math.round(suma * 100));
+
+  return valores;
+}
+
+function coincidePrecioPedido(p, term){
+  const n = parseTerminoPrecio(term);
+  if (n === null) return false; // el término no es un monto ("juan", "BS-42"...)
+
+  const centavos = centavosPedido(p);
+  if (!centavos.size) return false;
+
+  // "77.20" → coincidencia exacta al centavo.
+  if (/\d[.,]\d/.test(term)) return centavos.has(Math.round(n * 100));
+
+  // "77" → coincidencia parcial, para no tener que acordarse de los centavos.
+  // Con un solo dígito ("7") se cae a exacto, que si no sería demasiado ruido.
+  const digitos = String(Math.round(n));
+  if (digitos.length < 2) return centavos.has(Math.round(n * 100));
+  for (const c of centavos){
+    if (String(c).includes(digitos)) return true;
+  }
+  return false;
+}
+
+function getPedidoNumero(p){
+  return String(p.numero_orden || p.orderNumber || p.order_number || '').trim();
+}
+
+// El número de orden suele venir con prefijo (ej. "BS-246"), así que para
+// comparar rangos numéricos hay que extraer solo los dígitos.
+function getPedidoNumeroValor(p){
+  const digits = getPedidoNumero(p).replace(/\D+/g, '');
+  return digits ? Number(digits) : NaN;
+}
+
+function coincideBusquedaPedido(p, term){
+  if (!term) return true;
+  // Primero el monto: "77.20" o "$77,20" deben encontrar el pago aunque el
+  // término no coincida con nombre, teléfono, orden ni producto.
+  if (coincidePrecioPedido(p, term)) return true;
+  const nombre = normalizeText(p.nombre_comprador);
+  const telefono = normalizeText(p.telefono_comprador);
+  const orden = normalizeText(getPedidoNumero(p));
+  const compras = Array.isArray(p.compras) ? p.compras : [];
+  const productos = normalizeText(compras.map(c => c.name || c.nombre || '').join(' '));
+  return nombre.includes(term) || telefono.includes(term) || orden.includes(term) || productos.includes(term);
+}
+
+function toBoolean(value){
+  return value === true || value === 'true' || value === 1 || value === '1';
+}
+
+function getOriginalPedidoId(p){
+  return String(p.pedido_origen_id || p.id || '').trim();
+}
+
+function getPedidoFecha(p){
+  return p.fecha_registro_backend || p.fecha_asignacion || p.fecha_hora_entrada || null;
+}
+
+/* ------------------------- Filtro por día (string) -------------------------
+   El backend guarda las fechas como "YYYY-MM-DD HH:mm:ss" en hora de La Habana
+   (nowInTimeZone). Ese formato NO es ISO, así que Safari/iOS lo parsea como
+   NaN y un filtro basado en new Date() no mostraría nada en el móvil, que es
+   justo donde se instala la PWA. Por eso el filtro por día compara el fragmento
+   YYYY-MM-DD como texto: sin conversiones de zona horaria y sin desfase de un
+   día cuando el registro cae cerca de medianoche. */
+
+function diaDeFechaString(valor){
+  if (!valor) return null;
+  const s = String(valor).trim();
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return m[0];
+  const d = new Date(s);
+  if (isNaN(d)) return null;
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function fechaPedidoDia(p){
+  // Fecha en que se hizo el pedido. En la pestaña "Nuevos" es la columna "Fecha";
+  // en "Guardados"/"Seguimiento" viene del pedido original que el backend hidrata
+  // (pedido_origen_id). El fallback cubre registros viejos sin fecha_hora_entrada
+  // para que no desaparezcan al filtrar.
+  return diaDeFechaString(p.fecha_hora_entrada || p.fecha_registro_backend || p.fecha_asignacion);
+}
+
+function normalizePedidoState(p){
+  return {
+    ...p,
+    aceptado: toBoolean(p.aceptado),
+    entregado: toBoolean(p.entregado),
+    pendiente_pago: toBoolean(p.pendiente_pago),
+    pagado: toBoolean(p.pagado)
+  };
+}
+
+async function loadPedidosSection(force = false){
+  try{
+    // Un solo endpoint devuelve pedidos y pedidos asignados hidratados, ya
+    // proyectados (sin stock_afectados). Antes eran dos peticiones y dos
+    // descargas de /pedidos por cada refresco.
+    const data = await apiFetch('/api/panel/pedidos?compact=1', { force });
+    const asignados = data.pedidosAsignados || [];
+    const asignadosIds = new Set(asignados.map(p => p.pedido_origen_id || p.id));
+    state.pedidosNuevos = (data.pedidos || []).filter(p => !asignadosIds.has(p.id));
+    state.pedidosSeguimiento = asignados.map(p => normalizePedidoState({
+      ...p,
+      fecha_asignacion: p.fecha_asignacion || p.fecha_registro_backend || '—'
+    }));
+
+    renderPedidosNuevos();
+    renderPedidosGuardados();
+    renderPedidosSeguimiento();
+    actualizarBadgesPedidos();
+  }catch(e){ showToast('Error cargando pedidos: ' + e.message, true); }
+}
+
+document.getElementById('pedidos-refresh').addEventListener('click', () => loadPedidosSection(true));
+document.getElementById('pedidos-search').addEventListener('input', debounce(() => {
+  renderPedidosNuevos();
+  renderPedidosGuardados();
+  renderPedidosSeguimiento();
+}, 150));
+
+/* -------------------------- Pestañas Nuevos / Guardados / Seguimiento -------------------------- */
+
+let pedidosTabActual = 'nuevos';
+
+document.querySelectorAll('#pedidos-tabs .seg-tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    pedidosTabActual = btn.dataset.ptab;
+    document.querySelectorAll('#pedidos-tabs .seg-tab').forEach(b => b.classList.toggle('active', b === btn));
+    document.getElementById('pedidos-panel-nuevos').classList.toggle('active', pedidosTabActual === 'nuevos');
+    document.getElementById('pedidos-panel-guardados').classList.toggle('active', pedidosTabActual === 'guardados');
+    document.getElementById('pedidos-panel-seguimiento').classList.toggle('active', pedidosTabActual === 'seguimiento');
+    if (pedidosTabActual === 'guardados') renderPedidosGuardados();
+    if (pedidosTabActual === 'seguimiento') renderPedidosSeguimiento();
+    // "Nuevos" no se re-renderiza al cambiar de pestaña (ya está pintado), pero el
+    // contador del filtro sí debe seguir a la pestaña visible.
+    pintarContadorPedidos();
+  });
+});
+
+/* -------------------------------- Pedidos nuevos -------------------------------- */
+
+function renderPedidosNuevos(){
+  const term = pedidosSearchTerm();
+  const historial = [...state.pedidosNuevos, ...state.pedidosSeguimiento];
+  const base = state.pedidosNuevos.filter(p => coincideBusquedaPedido(p, term));
+  const list = base.filter(pasaFiltroFechaPedido);
+  registrarConteoPedidos('nuevos', list.length, base.length);
+
+  const tbody = document.getElementById('nuevos-tbody');
+  tbody.innerHTML = '';
+  document.getElementById('nuevos-empty').hidden = list.length !== 0;
+
+  const getEntregaClass = (fecha) => {
+    if (!fecha) return 'entrega-sin-fecha';
+    const hoy = new Date();
+    hoy.setHours(0, 0, 0, 0);
+    const hoyStr = hoy.toISOString().slice(0, 10);
+    if (fecha === hoyStr) return 'entrega-hoy';
+    if (fecha < hoyStr) return 'entrega-atrasado';
+    const fin = new Date(hoy);
+    fin.setDate(hoy.getDate() + 7);
+    const finStr = fin.toISOString().slice(0, 10);
+    if (fecha <= finStr) return 'entrega-proxima';
+    return 'entrega-futura';
+  };
+
+  list.forEach(p => {
+    const reincidente = esClienteReincidente(p, historial);
+    const tr = document.createElement('tr');
+    const entregaClass = getEntregaClass(p.fecha_entrega);
+    const entregaValue = p.fecha_entrega || '';
+    const entregaDisplay = entregaValue ? `<input type="date" class="entrega-input ${entregaClass}" value="${entregaValue}" data-id="${p.id}" title="Fecha de entrega">` : `<input type="date" class="entrega-input ${entregaClass}" data-id="${p.id}" title="Fecha de entrega" placeholder="Sin fecha">`;
+    const fechaPedido = getPedidoFecha(p);
+    tr.innerHTML = `
+      <td data-label="Fecha">${escapeHtml(fechaPedido ? new Date(fechaPedido).toLocaleString() : '—')}</td>
+      <td data-label="Orden">${escapeHtml(getPedidoNumero(p) || '—')}</td>
+      <td data-label="Comprador">${escapeHtml(p.nombre_comprador || '—')}</td>
+      <td data-label="Teléfono">${escapeHtml(p.telefono_comprador || '—')}</td>
+      <td data-label="Dirección">${escapeHtml(p.direccion_envio || '—')}</td>
+      <td data-label="Total">$${Number(p.precio_compra_total || 0).toFixed(2)}</td>
+      <td data-label="Fecha entrega">${entregaDisplay}</td>
+      <td data-label="Cliente">${reincidente ? `<span class="pill pill-warn">⏳ Ya compró</span>` : `<span class="pill pill-yes">✓ Nuevo</span>`}</td>
+      <td data-label="Acciones">
+        <div class="row-actions">
+          <button class="icon-btn" title="Ver detalle" aria-label="Ver detalle del pedido" data-view="${p.id}">👁</button>
+          ${reincidente ? `<button class="icon-btn" title="Ver pedido anterior de este cliente" aria-label="Ver pedido anterior de este cliente" data-prev="${p.id}">🕓</button>` : ''}
+          <button class="btn btn-primary btn-small" data-assign="${p.id}">Dar Seguimiento</button>
+          <button class="icon-btn" title="Eliminar" aria-label="Eliminar pedido nuevo" data-del="${p.id}">🗑</button>
+        </div>
+      </td>`;
+    tbody.appendChild(tr);
+  });
+
+  // Event listeners para inputs de fecha de entrega en pedidos nuevos
+  tbody.querySelectorAll('.entrega-input').forEach(input => {
+    input.addEventListener('change', async (e) => {
+      const id = e.target.dataset.id;
+      const fecha = e.target.value;
+      try {
+        await apiFetch(`/api/pedidos/${id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ fecha_entrega: fecha || null })
+        });
+        const idx = state.pedidosNuevos.findIndex(x => x.id === id);
+        if (idx !== -1) state.pedidosNuevos[idx].fecha_entrega = fecha || null;
+        const newClass = getEntregaClass(fecha || null);
+        e.target.className = `entrega-input ${newClass}`;
+        showToast('Fecha de entrega actualizada.');
+      } catch (err) {
+        showToast('Error actualizando fecha: ' + err.message, true);
+        const pedido = state.pedidosNuevos.find(x => x.id === id);
+        e.target.value = pedido?.fecha_entrega || '';
+      }
+    });
+  });
+
+  tbody.querySelectorAll('[data-view]').forEach(b => b.addEventListener('click', () => showPedidoDetalle(state.pedidosNuevos.find(x => x.id === b.dataset.view))));
+  tbody.querySelectorAll('[data-prev]').forEach(b => b.addEventListener('click', () => {
+    const actual = state.pedidosNuevos.find(x => x.id === b.dataset.prev);
+    const anterior = historial.find(item => item.id !== actual.id && ordersBelongToSameUser(item, actual));
+    if (anterior) showPedidoDetalle(anterior);
+  }));
+  tbody.querySelectorAll('[data-assign]').forEach(b => b.addEventListener('click', () => asignarPedido(b.dataset.assign)));
+  tbody.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', () => deletePedidoNuevo(b.dataset.del)));
+}
+
+function renderPedidosGuardados(){
+  const term = pedidosSearchTerm();
+  const base = state.pedidosSeguimiento.filter(p => coincideBusquedaPedido(p, term));
+  const list = base.filter(pasaFiltroFechaPedido);
+  registrarConteoPedidos('guardados', list.length, base.length);
+  const tbody = document.getElementById('guardados-tbody');
+  tbody.innerHTML = '';
+  document.getElementById('guardados-empty').hidden = list.length !== 0;
+
+  const getEntregaClass = (fecha) => {
+    if (!fecha) return 'entrega-sin-fecha';
+    const hoy = new Date();
+    hoy.setHours(0, 0, 0, 0);
+    const hoyStr = hoy.toISOString().slice(0, 10);
+    if (fecha === hoyStr) return 'entrega-hoy';
+    if (fecha < hoyStr) return 'entrega-atrasado';
+    const fin = new Date(hoy);
+    fin.setDate(hoy.getDate() + 7);
+    const finStr = fin.toISOString().slice(0, 10);
+    if (fecha <= finStr) return 'entrega-proxima';
+    return 'entrega-futura';
+  };
+
+  list.forEach(p => {
+    const marcador = MARCADOR[estadoPedidoKey(p)];
+    const reincidente = esClienteReincidente(p, [...state.pedidosNuevos, ...state.pedidosSeguimiento]);
+    const tr = document.createElement('tr');
+    const entregaClass = getEntregaClass(p.fecha_entrega);
+    const entregaDisplay = p.fecha_entrega 
+      ? `<span class="entrega-badge ${entregaClass}">${escapeHtml(p.fecha_entrega)}</span>` 
+      : `<span class="entrega-badge entrega-sin-fecha">—</span>`;
+    tr.innerHTML = `
+      <td data-label="Fecha asignación">${escapeHtml(p.fecha_asignacion || '—')}</td>
+      <td data-label="Orden">${escapeHtml(getPedidoNumero(p) || '—')}</td>
+      <td data-label="Comprador">${escapeHtml(p.nombre_comprador || '—')}</td>
+      <td data-label="Teléfono">${escapeHtml(p.telefono_comprador || '—')}</td>
+      <td data-label="Total">$${Number(p.precio_compra_total || 0).toFixed(2)}</td>
+      <td data-label="Fecha entrega">${entregaDisplay}</td>
+      <td data-label="Ya Compró">${reincidente ? `<span class="pill pill-warn">⏳ Sí</span>` : `<span class="pill pill-no">— No</span>`}</td>
+      <td data-label="Estado"><span class="pill ${marcador.cls}">${marcador.text}</span></td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+async function asignarPedido(id){
+  try{
+    const pedidoNuevo = state.pedidosNuevos.find(p => p.id === id);
+    const fechaEntrega = pedidoNuevo?.fecha_entrega || null;
+    const { pedido } = await apiFetch(`/api/pedidos/${id}/asignar`, {
+      method: 'POST',
+      body: JSON.stringify({ 
+        aceptado: false, 
+        entregado: false, 
+        pendiente_pago: false, 
+        pagado: false,
+        fecha_entrega: fechaEntrega
+      })
+    });
+    state.pedidosNuevos = state.pedidosNuevos.filter(p => p.id !== id);
+    state.pedidosSeguimiento.push(normalizePedidoState({
+      ...pedido,
+      fecha_asignacion: pedido.fecha_asignacion || pedido.fecha_registro_backend || '—'
+    }));
+    showToast('Pedido guardado.');
+    renderPedidosNuevos();
+    renderPedidosGuardados();
+    renderPedidosSeguimiento();
+    actualizarBadgesPedidos();
+  }catch(e){ showToast('Error asignando pedido: ' + e.message, true); }
+}
+
+async function deletePedidoNuevo(id){
+  if (!confirm('¿Eliminar este pedido nuevo?')) return;
+  try{
+    await apiFetch(`/api/pedidos/${id}`, { method: 'DELETE' });
+    state.pedidosNuevos = state.pedidosNuevos.filter(p => p.id !== id);
+    showToast('Pedido eliminado.');
+    renderPedidosNuevos();
+    renderPedidosGuardados();
+    actualizarBadgesPedidos();
+  }catch(e){ showToast('Error eliminando: ' + e.message, true); }
+}
+
+/* ------------------------------ Pedidos guardados ------------------------------- */
+
+const ESTADO_FIELDS = [
+  { key: 'aceptado',       short: 'Aceptado',    label: 'Aceptado' },
+  { key: 'entregado',      short: 'Entregado',   label: 'Entregado' },
+  { key: 'pendiente_pago', short: 'Pend. pago',  label: 'Pendiente de pago' },
+  { key: 'pagado',         short: 'Pagado',      label: 'Pagado' },
+];
+
+function estadoPedidoKey(p){
+  if (toBoolean(p.entregado) && toBoolean(p.pagado)) return 'completado';
+  if (toBoolean(p.pagado) && !toBoolean(p.entregado)) return 'pagado';
+  if (toBoolean(p.aceptado) || toBoolean(p.entregado) || toBoolean(p.pendiente_pago)) return 'proceso';
+  return 'pendiente';
+}
+const MARCADOR = {
+  pendiente:  { text: '⏳ Pendiente',  cls: 'pill-no',   textPlano: 'Pendiente' },
+  proceso:    { text: '⏳ En proceso', cls: 'pill-warn', textPlano: 'En proceso' },
+  pagado:     { text: '✓ Pagado',      cls: 'pill-yes',  textPlano: 'Pagado' },
+  completado: { text: '✓ Completado',  cls: 'pill-yes',  textPlano: 'Completado' },
+};
+
+function isPedidoPagadoNoEntregado(p){
+  return toBoolean(p.pagado) && !toBoolean(p.entregado);
+}
+
+function isPedidoVisibleEnSeguimiento(p){
+  return !isPedidoPagadoNoEntregado(p);
+}
+
+let segTabActual = 'proceso';
+let segFiltroEntrega = 'todos';
+
+// Agrupa pedidos "en proceso" por cliente usando la misma lógica de
+// ordersBelongToSameUser (teléfono, correo o id de usuario), pero de forma
+// transitiva: si A coincide con B y B coincide con C, los 3 quedan en el
+// mismo grupo aunque A y C no compartan directamente el mismo campo
+// (evita duplicar/perder pedidos cuando el teléfono viene guardado con
+// formato distinto, ej. con o sin código de país).
+function agruparPedidosPorCliente(items){
+  const parent = items.map((_, i) => i);
+  function find(i){ while (parent[i] !== i){ parent[i] = parent[parent[i]]; i = parent[i]; } return i; }
+  function union(i, j){ const ri = find(i), rj = find(j); if (ri !== rj) parent[ri] = rj; }
+  for (let i = 0; i < items.length; i++){
+    for (let j = i + 1; j < items.length; j++){
+      if (ordersBelongToSameUser(items[i], items[j])) union(i, j);
+    }
+  }
+  const grupos = new Map();
+  items.forEach((p, i) => {
+    const r = find(i);
+    if (!grupos.has(r)) grupos.set(r, []);
+    grupos.get(r).push(p);
+  });
+  return [...grupos.values()];
+}
+
+function renderPedidosSeguimiento(flashId){
+  const term = pedidosSearchTerm();
+  const historial = [...state.pedidosNuevos, ...state.pedidosSeguimiento];
+  const base = state.pedidosSeguimiento.filter(p => {
+    if (!isPedidoVisibleEnSeguimiento(p)) return false;
+    const key = estadoPedidoKey(p);
+    const enPestaña = segTabActual === 'completado' ? key === 'completado' : key !== 'completado';
+    return enPestaña && coincideBusquedaPedido(p, term) && pasaFiltroEntrega(p);
+  });
+  const list = base.filter(pasaFiltroFechaPedido);
+  registrarConteoPedidos('seguimiento', list.length, base.length);
+
+  ordenarPedidosSeguimiento(list);
+
+  const pedidosProceso = list.filter(p => estadoPedidoKey(p) === 'proceso');
+  const grupoPorId = new Map();
+  agruparPedidosPorCliente(pedidosProceso).forEach(grupo => {
+    if (grupo.length > 1) grupo.forEach(p => grupoPorId.set(p.id, grupo));
+  });
+
+  // Reordena la lista para que los pedidos de un mismo grupo queden
+  // realmente contiguos: antes solo se insertaba el encabezado al llegar
+  // al primer miembro, pero el resto del grupo seguía en su posición
+  // original dentro de `list`, apareciendo en otro punto de la tabla.
+  const listaIds = new Set(list.map(p => p.id));
+  const listaOrdenada = [];
+  const yaColocados = new Set();
+  list.forEach(p => {
+    if (yaColocados.has(p.id)) return;
+    const grupo = grupoPorId.get(p.id);
+    if (grupo){
+      grupo.filter(g => listaIds.has(g.id)).forEach(g => {
+        if (!yaColocados.has(g.id)){
+          listaOrdenada.push(g);
+          yaColocados.add(g.id);
+        }
+      });
+    } else {
+      listaOrdenada.push(p);
+      yaColocados.add(p.id);
+    }
+  });
+
+  const tbody = document.getElementById('seg-tbody');
+  tbody.innerHTML = '';
+  document.getElementById('seg-empty').hidden = list.length !== 0;
+
+  const gruposMostrados = new Set();
+  const trIndexById = new Map();
+
+  // Helper para clase CSS según estado de fecha de entrega
+  const getEntregaClass = (fecha) => {
+    if (!fecha) return 'entrega-sin-fecha';
+    const hoy = new Date();
+    hoy.setHours(0, 0, 0, 0);
+    const hoyStr = hoy.toISOString().slice(0, 10);
+    if (fecha === hoyStr) return 'entrega-hoy';
+    if (fecha < hoyStr) return 'entrega-atrasado';
+    const fin = new Date(hoy);
+    fin.setDate(hoy.getDate() + 7);
+    const finStr = fin.toISOString().slice(0, 10);
+    if (fecha <= finStr) return 'entrega-proxima';
+    return 'entrega-futura';
+  };
+
+  listaOrdenada.forEach(p => {
+    const grupo = grupoPorId.get(p.id);
+
+    if (grupo && !gruposMostrados.has(grupo)){
+      gruposMostrados.add(grupo);
+      const total = grupo.reduce((s, g) => s + Number(g.precio_compra_total || 0), 0);
+      const trGrupo = document.createElement('tr');
+      trGrupo.className = 'seg-grupo-row';
+      trGrupo.innerHTML = `<td colspan="10"><span class="seg-grupo-icon">🔗</span> ${escapeHtml(p.nombre_comprador || 'Cliente')} — ${grupo.length} pedidos en proceso — Total: $${total.toFixed(2)}</td>`;
+      tbody.appendChild(trGrupo);
+    }
+
+    const reincidente = esClienteReincidente(p, historial);
+    const tr = document.createElement('tr');
+    if (grupo) tr.className = 'seg-agrupado';
+    const marcador = MARCADOR[estadoPedidoKey(p)];
+    const entregaClass = getEntregaClass(p.fecha_entrega);
+    const entregaValue = p.fecha_entrega || '';
+    const entregaDisplay = entregaValue ? `<input type="date" class="entrega-input ${entregaClass}" value="${entregaValue}" data-id="${p.id}" title="Fecha de entrega">` : `<input type="date" class="entrega-input ${entregaClass}" data-id="${p.id}" title="Fecha de entrega" placeholder="Sin fecha">`;
+    tr.innerHTML = `
+      <td data-label="Fecha asignación">${escapeHtml(p.fecha_asignacion || '—')}</td>
+      <td data-label="Orden">${escapeHtml(getPedidoNumero(p) || '—')}</td>
+      <td data-label="Comprador">${escapeHtml(p.nombre_comprador || '—')}</td>
+      <td data-label="Teléfono">${escapeHtml(p.telefono_comprador || '—')}</td>
+      <td data-label="Total">$${Number(p.precio_compra_total || 0).toFixed(2)}</td>
+      <td data-label="Ya Compró">${reincidente ? `<span class="pill pill-warn">⏳ Sí</span>` : `<span class="pill pill-no">— No</span>`}</td>
+      <td data-label="Fecha entrega">${entregaDisplay}</td>
+      <td data-label="Estados">
+        <div class="estado-checks" data-estados="${p.id}">
+          ${ESTADO_FIELDS.map(f => {
+            if (f.key === 'pendiente_pago' && toBoolean(p.pagado)) return '';
+            const checked = toBoolean(p[f.key]);
+            return `
+            <label class="estado-check" title="${f.label}">
+              <input type="checkbox" data-campo="${f.key}" ${checked ? 'checked' : ''}>
+              ${f.short}
+            </label>`;
+          }).join('')}
+        </div>
+      </td>
+      <td data-label="Marcador"><span class="pill ${marcador.cls}">${marcador.text}</span></td>
+      <td data-label="Acciones">
+        <div class="row-actions">
+          <button class="icon-btn" title="Ver detalle" aria-label="Ver detalle del pedido" data-view="${p.id}">👁</button>
+          <button class="icon-btn" title="Eliminar" aria-label="Eliminar pedido en seguimiento" data-del="${p.id}">🗑</button>
+        </div>
+      </td>`;
+    tbody.appendChild(tr);
+    trIndexById.set(p.id, tr);
+  });
+
+  // Event listeners para inputs de fecha de entrega
+  tbody.querySelectorAll('.entrega-input').forEach(input => {
+    input.addEventListener('change', async (e) => {
+      const id = e.target.dataset.id;
+      const fecha = e.target.value; // YYYY-MM-DD o vacío
+      try {
+        await apiFetch(`/api/pedidos-asignados/${id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ fecha_entrega: fecha || null })
+        });
+        // Actualizar estado local
+        const idx = state.pedidosSeguimiento.findIndex(x => x.id === id);
+        if (idx !== -1) state.pedidosSeguimiento[idx].fecha_entrega = fecha || null;
+        // Actualizar clase visual
+        const newClass = getEntregaClass(fecha || null);
+        e.target.className = `entrega-input ${newClass}`;
+        showToast('Fecha de entrega actualizada.');
+      } catch (err) {
+        showToast('Error actualizando fecha: ' + err.message, true);
+        // Revertir valor en el input
+        const pedido = state.pedidosSeguimiento.find(x => x.id === id);
+        e.target.value = pedido?.fecha_entrega || '';
+      }
+    });
+  });
+
+  tbody.querySelectorAll('[data-estados]').forEach(container => {
+    const id = container.dataset.estados;
+    container.querySelectorAll('input[type=checkbox]').forEach(chk => {
+      chk.addEventListener('change', () => {
+        const campo = chk.dataset.campo;
+        const cambios = { [campo]: chk.checked };
+        if (campo === 'pagado' && chk.checked) cambios.pendiente_pago = false;
+        if (campo === 'pendiente_pago' && chk.checked) cambios.pagado = false;
+        updateEstadosPedido(id, cambios);
+      });
+    });
+  });
+  tbody.querySelectorAll('[data-view]').forEach(b => b.addEventListener('click', () => showPedidoDetalle(state.pedidosSeguimiento.find(x => x.id === b.dataset.view))));
+  tbody.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', () => deletePedidoSeguimiento(b.dataset.del)));
+
+  if (flashId && trIndexById.has(flashId)){
+    const trFlash = trIndexById.get(flashId);
+    trFlash.classList.add('row-saved-flash');
+    setTimeout(() => trFlash.classList.remove('row-saved-flash'), 1000);
+  }
+
+  actualizarBadgesPedidos();
+}
+
+/* --------------------- Orden y filtro rápido de fecha (Pedidos) --------------------- */
+
+let segSortBy = 'fecha_desc';
+
+function ordenarPedidosSeguimiento(list){
+  const fechaVal = p => { const t = new Date(p.fecha_asignacion || p.fecha_registro_backend || 0).getTime(); return isNaN(t) ? 0 : t; };
+  const entregaVal = p => { const t = new Date((p.fecha_entrega || '') + 'T00:00:00').getTime(); return isNaN(t) ? 0 : t; };
+  if (segSortBy === 'fecha_asc') list.sort((a, b) => fechaVal(a) - fechaVal(b));
+  else if (segSortBy === 'fecha_desc') list.sort((a, b) => fechaVal(b) - fechaVal(a));
+  else if (segSortBy === 'entrega_asc') list.sort((a, b) => entregaVal(a) - entregaVal(b));
+  else if (segSortBy === 'entrega_desc') list.sort((a, b) => entregaVal(b) - entregaVal(a));
+  else if (segSortBy === 'total_desc') list.sort((a, b) => Number(b.precio_compra_total || 0) - Number(a.precio_compra_total || 0));
+  else if (segSortBy === 'total_asc') list.sort((a, b) => Number(a.precio_compra_total || 0) - Number(b.precio_compra_total || 0));
+  return list;
+}
+
+const segSortSelect = document.getElementById('seg-sort');
+if (segSortSelect){
+  segSortSelect.addEventListener('change', () => {
+    segSortBy = segSortSelect.value;
+    renderPedidosSeguimiento();
+  });
+}
+
+let pedidosFiltroFecha = 'todos';
+
+// Rango personalizado (pedidosFiltroFecha === 'custom'). null en cada lado
+// significa "sin límite": solo "Desde" = desde ese día en adelante,
+// solo "Hasta" = hasta ese día.
+let pedidosRangoCustom = { desde: null, hasta: null };
+
+// "Mostrando X de Y" por pestaña. El denominador (base) es la lista ANTES del
+// filtro de fecha, para que se vea cuántos pedidos están ocultos y no solo 0.
+const pedidosConteo = {
+  nuevos: { mostrados: null, base: null },
+  guardados: { mostrados: null, base: null },
+  seguimiento: { mostrados: null, base: null }
+};
+const ETIQUETA_PEDIDOS_TAB = { nuevos: 'Nuevos', guardados: 'Guardados', seguimiento: 'Seguimiento' };
+
+function registrarConteoPedidos(clave, mostrados, base){
+  if (!pedidosConteo[clave]) return;
+  pedidosConteo[clave].mostrados = mostrados;
+  pedidosConteo[clave].base = base;
+  pintarContadorPedidos();
+}
+
+function pintarContadorPedidos(){
+  const el = document.getElementById('ped-filtro-resumen');
+  if (!el) return;
+  const c = pedidosConteo[pedidosTabActual];
+  if (!c || c.base === null){ el.textContent = ''; return; }
+
+  const etiqueta = ETIQUETA_PEDIDOS_TAB[pedidosTabActual] || '';
+  let txt = `Mostrando ${c.mostrados} de ${c.base} pedidos · ${etiqueta}`;
+
+  if (pedidosFiltroFecha === 'custom' && (pedidosRangoCustom.desde || pedidosRangoCustom.hasta)){
+    const desde = pedidosRangoCustom.desde || 'inicio';
+    const hasta = pedidosRangoCustom.hasta || 'hoy';
+    txt += ` · Rango ${desde} → ${hasta}`;
+  }
+  if (c.mostrados === 0 && c.base > 0) txt += ' · sin coincidencias para el filtro';
+
+  el.textContent = txt;
+}
+
+function limpiarCamposRangoPedidos(){
+  const desdeEl = document.getElementById('ped-fecha-desde');
+  const hastaEl = document.getElementById('ped-fecha-hasta');
+  const quitarEl = document.getElementById('ped-fecha-quitar');
+  if (desdeEl) desdeEl.value = '';
+  if (hastaEl) hastaEl.value = '';
+  if (quitarEl) quitarEl.hidden = true;
+}
+
+// Repinta las 3 tablas. Todo cambio de filtro (fecha, búsqueda, rango) pasa por
+// aquí para que el contador quede sincronizado siempre.
+function refrescarFiltrosPedidos(){
+  renderPedidosNuevos();
+  renderPedidosGuardados();
+  renderPedidosSeguimiento();
+}
+
+function esDeEstaSemana(fechaStr){
+  if (!fechaStr) return false;
+  const f = new Date(fechaStr);
+  if (isNaN(f)) return false;
+  const hoy = new Date();
+  const inicioSemana = new Date(hoy);
+  const diaSemana = (hoy.getDay() + 6) % 7; // lunes = 0
+  inicioSemana.setDate(hoy.getDate() - diaSemana);
+  inicioSemana.setHours(0, 0, 0, 0);
+  const finSemana = new Date(inicioSemana);
+  finSemana.setDate(inicioSemana.getDate() + 7);
+  return f >= inicioSemana && f < finSemana;
+}
+
+function pasaFiltroFechaPedido(p){
+  if (pedidosFiltroFecha === 'custom'){
+    // Comparación de strings: en formato ISO el orden lexicográfico coincide con
+    // el cronológico, así que no hace falta construir objetos Date.
+    const dia = fechaPedidoDia(p);
+    if (!dia) return false; // registro sin ninguna fecha usable
+    if (pedidosRangoCustom.desde && dia < pedidosRangoCustom.desde) return false;
+    if (pedidosRangoCustom.hasta && dia > pedidosRangoCustom.hasta) return false;
+    return true;
+  }
+  if (pedidosFiltroFecha === 'todos') return true;
+  const fecha = getPedidoFecha(p);
+  if (pedidosFiltroFecha === 'hoy') return fechaHoy(fecha);
+  if (pedidosFiltroFecha === 'ayer') return fechaAyer(fecha);
+  if (pedidosFiltroFecha === 'semana') return esDeEstaSemana(fecha);
+  if (pedidosFiltroFecha === 'mes') return esDelMesActual(fecha);
+  return true;
+}
+
+function pasaFiltroEntrega(p){
+  if (segFiltroEntrega === 'todos') return true;
+  const fecha = p.fecha_entrega;
+  if (!fecha) return segFiltroEntrega === 'sin_fecha';
+  const f = new Date(fecha + 'T00:00:00');
+  if (isNaN(f)) return false;
+  const hoy = new Date();
+  hoy.setHours(0, 0, 0, 0);
+  const hoyStr = hoy.toISOString().slice(0, 10);
+  if (segFiltroEntrega === 'hoy') return fecha === hoyStr;
+  if (segFiltroEntrega === 'atrasados') return fecha < hoyStr;
+  if (segFiltroEntrega === 'semana') return esDeEstaSemana(fecha);
+  if (segFiltroEntrega === 'proximos7') {
+    const fin = new Date(hoy);
+    fin.setDate(hoy.getDate() + 7);
+    const finStr = fin.toISOString().slice(0, 10);
+    return fecha >= hoyStr && fecha <= finStr;
+  }
+  if (segFiltroEntrega === 'mes') return esDelMesActual(fecha);
+  if (segFiltroEntrega === 'sin_fecha') return !fecha;
+  return true;
+}
+
+document.querySelectorAll('#pedidos-filtro-fecha .seg-tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    pedidosFiltroFecha = btn.dataset.pfiltro;
+    // Al elegir un preset se descarta el rango personalizado y sus campos.
+    pedidosRangoCustom = { desde: null, hasta: null };
+    document.querySelectorAll('#pedidos-filtro-fecha .seg-tab').forEach(b => b.classList.toggle('active', b === btn));
+    limpiarCamposRangoPedidos();
+    refrescarFiltrosPedidos();
+  });
+});
+
+/* --------------------- Rango de fechas personalizado --------------------- */
+
+document.getElementById('ped-fecha-aplicar')?.addEventListener('click', () => {
+  const desdeEl = document.getElementById('ped-fecha-desde');
+  const hastaEl = document.getElementById('ped-fecha-hasta');
+  const desde = desdeEl ? desdeEl.value : '';
+  const hasta = hastaEl ? hastaEl.value : '';
+
+  if (!desde && !hasta){
+    showToast('Selecciona al menos una fecha: "Desde" o "Hasta".', true);
+    return;
+  }
+  if (desde && hasta && desde > hasta){
+    showToast('La fecha "Desde" no puede ser posterior a "Hasta".', true);
+    return;
+  }
+
+  pedidosRangoCustom = { desde: desde || null, hasta: hasta || null };
+  pedidosFiltroFecha = 'custom';
+  // Ningún preset queda activo mientras haya un rango manual.
+  document.querySelectorAll('#pedidos-filtro-fecha .seg-tab').forEach(b => b.classList.remove('active'));
+  const quitarEl = document.getElementById('ped-fecha-quitar');
+  if (quitarEl) quitarEl.hidden = false;
+
+  refrescarFiltrosPedidos();
+
+  const c = pedidosConteo[pedidosTabActual];
+  showToast(c && c.mostrados > 0
+    ? `${c.mostrados} pedido(s) en el rango ${pedidosRangoCustom.desde || 'inicio'} → ${pedidosRangoCustom.hasta || 'hoy'}.`
+    : 'No hay pedidos en ese rango.');
+});
+
+document.getElementById('ped-fecha-quitar')?.addEventListener('click', () => {
+  pedidosRangoCustom = { desde: null, hasta: null };
+  pedidosFiltroFecha = 'todos';
+  limpiarCamposRangoPedidos();
+  const tabTodos = document.querySelector('#pedidos-filtro-fecha .seg-tab[data-pfiltro="todos"]');
+  if (tabTodos) tabTodos.classList.add('active');
+  refrescarFiltrosPedidos();
+});
+
+document.querySelectorAll('#seg-filtro-entrega .seg-tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    segFiltroEntrega = btn.dataset.entrega;
+    document.querySelectorAll('#seg-filtro-entrega .seg-tab').forEach(b => b.classList.toggle('active', b === btn));
+    renderPedidosSeguimiento();
+  });
+});
+
+/* ------------------------------- Exportar CSV ------------------------------- */
+
+function exportarCSV(headers, rows, filename){
+  const escapeCell = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const csv = [headers, ...rows].map(r => r.map(escapeCell).join(',')).join('\r\n');
+  const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  showToast('CSV exportado.');
+}
+
+function exportarPedidosCSV(){
+  const headers = ['Fecha', 'Orden', 'Comprador', 'Teléfono', 'Dirección', 'Total', 'Fecha entrega', 'Estado'];
+  // El CSV exporta lo mismo que se está viendo: respetando la búsqueda (incluido
+  // el monto) y el filtro de fecha activo.
+  const term = pedidosSearchTerm();
+  const pasaFiltros = p => coincideBusquedaPedido(p, term) && pasaFiltroFechaPedido(p);
+  const todos = [
+    ...state.pedidosNuevos.filter(pasaFiltros).map(p => ({ ...p, _estado: 'Nuevo' })),
+    ...state.pedidosSeguimiento.filter(pasaFiltros).map(p => ({ ...p, _estado: MARCADOR[estadoPedidoKey(p)].textPlano }))
+  ];
+  const rows = todos.map(p => [
+    // getPedidoFecha y no fecha_asignacion: los pedidos NUEVOS no tienen
+    // fecha_asignacion, así que esa columna salía vacía para ellos.
+    getPedidoFecha(p) || '',
+    getPedidoNumero(p) || '',
+    p.nombre_comprador || '',
+    p.telefono_comprador || '',
+    p.direccion_envio || '',
+    Number(p.precio_compra_total || 0).toFixed(2),
+    p.fecha_entrega || '',
+    p._estado || ''
+  ]);
+  exportarCSV(headers, rows, `pedidos-buquenque-${new Date().toISOString().slice(0, 10)}.csv`);
+}
+
+const btnExportPedidos = document.getElementById('pedidos-export-csv');
+if (btnExportPedidos) btnExportPedidos.addEventListener('click', exportarPedidosCSV);
+
+document.querySelectorAll('#seg-tabs .seg-tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    segTabActual = btn.dataset.tab;
+    document.querySelectorAll('#seg-tabs .seg-tab').forEach(b => b.classList.toggle('active', b === btn));
+    renderPedidosSeguimiento();
+  });
+});
+
+async function updateEstadosPedido(id, cambios){
+  try{
+    const { pedido } = await apiFetch(`/api/pedidos-asignados/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(cambios)
+    });
+    const idx = state.pedidosSeguimiento.findIndex(p => p.id === id);
+    if (idx !== -1) state.pedidosSeguimiento[idx] = normalizePedidoState(pedido);
+    showToast('Estado actualizado.');
+    renderPedidosSeguimiento(id);
+  }catch(e){
+    showToast('Error actualizando estado: ' + e.message, true);
+    renderPedidosSeguimiento(); // revierte el checkbox visualmente si falló
+  }
+}
+
+async function deletePedidoSeguimiento(id){
+  if (!confirm('¿Eliminar este pedido guardado?')) return;
+  try{
+    await apiFetch(`/api/pedidos-asignados/${id}`, { method: 'DELETE' });
+    state.pedidosSeguimiento = state.pedidosSeguimiento.filter(p => p.id !== id);
+    showToast('Pedido eliminado.');
+    renderPedidosSeguimiento();
+  }catch(e){ showToast('Error eliminando: ' + e.message, true); }
+}
+
+/* --------------------------- Badges (sidebar + pestañas) --------------------------- */
+
+function actualizarBadgesPedidos(){
+  const nuevosCount = state.pedidosNuevos.length;
+  const guardadosCount = state.pedidosSeguimiento.length;
+  const enProceso = state.pedidosSeguimiento.filter(p => isPedidoVisibleEnSeguimiento(p) && estadoPedidoKey(p) !== 'completado').length;
+  const completados = state.pedidosSeguimiento.filter(p => estadoPedidoKey(p) === 'completado').length;
+
+  setText('tab-count-nuevos', nuevosCount);
+  setText('tab-count-guardados', guardadosCount);
+  setText('tab-count-seguimiento', enProceso);
+  setText('seg-count-proceso', enProceso);
+  setText('seg-count-completado', completados);
+  setText('badge-pedidos', nuevosCount + enProceso);
+}
+
+/* -------------------------- Detalle de pedido -------------------------- */
+
+// Referencia al pedido abierto actualmente en el modal y estado de edición
+// de su listado de productos (compras). Se resetean cada vez que se abre
+// el modal desde showPedidoDetalle.
+let pedidoDetalleActual = null;
+let pedidoDetalleEditando = false;
+let pedidoDetalleDatosEditando = false;
+let pedidoDetalleComprasEdit = [];
+
+document.getElementById('pedido-descargar-factura')?.addEventListener('click', () => {
+  descargarFacturaPedido(pedidoDetalleActual);
+});
+
+function pedidoDetalleEsSeguimiento(p){
+  return !!(p && p.fecha_asignacion);
+}
+
+function endpointPedidoDetalle(){
+  const id = pedidoDetalleActual && pedidoDetalleActual.id;
+  return pedidoDetalleEsSeguimiento(pedidoDetalleActual) ? `/api/pedidos-asignados/${id}` : `/api/pedidos/${id}`;
+}
+
+function showPedidoDetalle(p){
+  if (!p) return;
+  pedidoDetalleActual = p;
+  pedidoDetalleEditando = false;
+  pedidoDetalleDatosEditando = false;
+  pedidoDetalleComprasEdit = [];
+  renderPedidoDetalleBody();
+  openModal('modal-pedido');
+}
+
+function fechaFactura(pedido){
+  const raw = String(pedido.fecha_hora_entrada || pedido.fecha_registro_backend || pedido.fecha_asignacion || '').trim();
+  const localParts = raw.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (localParts) return `${localParts[3]}/${localParts[2]}/${localParts[1]}, ${localParts[4]}:${localParts[5]}:${localParts[6] || '00'}`;
+  const parsed = raw ? new Date(raw) : new Date();
+  if (Number.isNaN(parsed.getTime())) return raw || new Date().toLocaleString('es-ES');
+  return parsed.toLocaleString('es-ES', {
+    timeZone: 'America/Havana', day: '2-digit', month: '2-digit', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+  });
+}
+
+function facturaSetText(id, value, optional = false){
+  const element = document.getElementById(id);
+  if (!element) return;
+  const text = String(value || '').trim();
+  element.textContent = text;
+  if (optional) element.hidden = !text;
+}
+
+function facturaMoney(cents){
+  return `$${(cents / 100).toFixed(2)}`;
+}
+
+async function descargarFacturaPedido(pedido){
+  if (!pedido) return;
+  if (typeof window.html2canvas !== 'function'){
+    showToast('No se pudo cargar html2canvas. Comprueba la conexión e inténtalo de nuevo.', true);
+    return;
+  }
+
+  const receipt = document.getElementById('receipt-export');
+  const tbody = document.getElementById('export-table-body');
+  if (!receipt || !tbody){
+    showToast('No está disponible la plantilla de factura.', true);
+    return;
+  }
+
+  const orderNumber = getPedidoNumero(pedido) || pedido.id || 'SIN-ORDEN';
+  facturaSetText('export-order-id', `ORDEN: #${orderNumber}`);
+  facturaSetText('export-date', fechaFactura(pedido));
+  facturaSetText('export-client-name', pedido.nombre_comprador || 'CLIENTE GENÉRICO');
+  facturaSetText('export-address', `DIRECCIÓN: ${pedido.direccion_envio || 'N/A'}`);
+  facturaSetText('export-delivery-method', pedido.metodo_entrega || pedido.delivery_method || '', true);
+  facturaSetText('export-priority', pedido.prioridad || pedido.priority || '', true);
+  facturaSetText('export-recipient-name', `RECIBE: ${pedido.nombre_persona_entrega || 'N/A'}`);
+  facturaSetText('export-recipient-phone', `TELÉFONO DE ENTREGA: ${pedido.telefono_persona_entrega || 'N/A'}`);
+  facturaSetText('export-buyer-phone', `TELÉFONO DEL COMPRADOR: ${pedido.telefono_comprador || 'N/A'}`);
+
+  const items = Array.isArray(pedido.compras) ? pedido.compras : [];
+  tbody.replaceChildren();
+  let subtotalCents = 0;
+  let totalItemsCents = 0;
+  items.forEach(item => {
+    if (!item) return;
+    const quantity = Math.max(0, Math.floor(Number(item.quantity ?? item.cantidad ?? 0)));
+    if (quantity <= 0) return;
+    const listPriceCents = Math.max(0, Math.round(Number(item.listPrice ?? item.unitPrice ?? item.precio ?? 0) * 100));
+    const finalPriceCents = Math.max(0, Math.round(Number(item.unitPrice ?? item.precio ?? 0) * 100));
+    subtotalCents += listPriceCents * quantity;
+    totalItemsCents += finalPriceCents * quantity;
+
+    const row = document.createElement('tr');
+    [item.name || item.nombre || 'Producto', String(quantity), facturaMoney(listPriceCents), facturaMoney(listPriceCents * quantity)].forEach(value => {
+      const cell = document.createElement('td');
+      cell.textContent = value;
+      row.appendChild(cell);
+    });
+    tbody.appendChild(row);
+  });
+  if (!tbody.children.length){
+    const row = document.createElement('tr');
+    const cell = document.createElement('td');
+    cell.colSpan = 4;
+    cell.textContent = 'No hay productos registrados';
+    row.appendChild(cell);
+    tbody.appendChild(row);
+  }
+
+  const savedTotal = Number(pedido.precio_compra_total);
+  const totalCents = Number.isFinite(savedTotal) ? Math.max(0, Math.round(savedTotal * 100)) : totalItemsCents;
+  const discountCents = Math.max(0, subtotalCents - totalCents);
+  facturaSetText('export-subtotal', facturaMoney(subtotalCents));
+  facturaSetText('export-discounts', `+$${(discountCents / 100).toFixed(2)}`);
+  facturaSetText('export-total', facturaMoney(totalCents));
+
+  try{
+    if (document.fonts?.ready) await document.fonts.ready;
+    const canvas = await window.html2canvas(receipt, {
+      scale: 2.5,
+      backgroundColor: '#ffffff',
+      useCORS: true,
+      logging: false,
+      allowTaint: false
+    });
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+    if (!blob) throw new Error('No fue posible convertir la factura a PNG.');
+
+    const safeOrderNumber = String(orderNumber).replace(/[^a-z0-9_-]/gi, '-');
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `Factura_${safeOrderNumber}.png`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    showToast(`Factura de la orden ${orderNumber} descargada.`);
+  }catch(error){
+    showToast('Error generando la factura: ' + error.message, true);
+  }
+}
+
+function totalComprasEdit(){
+  return pedidoDetalleComprasEdit.reduce((acc, c) => acc + (Number(c.unitPrice) || 0) * (Number(c.quantity) || 0), 0);
+}
+
+function renderPedidoDetalleBody(){
+  const body = document.getElementById('pedido-detalle-body');
+  const p = pedidoDetalleActual;
+  if (!p || !body) return;
+
+  const compras = Array.isArray(p.compras) ? p.compras : [];
+
+  const cabecera = `
+    <dl class="detail-grid">
+      <dt>Número de orden</dt><dd>${escapeHtml(getPedidoNumero(p) || '—')}</dd>
+      <dt>Comprador</dt><dd>${pedidoDetalleDatosEditando ? `<input class="pedido-contact-input" id="pedido-contact-nombre" aria-label="Comprador" maxlength="160" value="${escapeHtml(p.nombre_comprador || '')}">` : escapeHtml(p.nombre_comprador || '—')}</dd>
+      <dt>Teléfono</dt><dd>${pedidoDetalleDatosEditando ? `<input class="pedido-contact-input" id="pedido-contact-telefono" aria-label="Teléfono del comprador" maxlength="50" value="${escapeHtml(p.telefono_comprador || '')}">` : escapeHtml(p.telefono_comprador || '—')}</dd>
+      <dt>Correo</dt><dd>${escapeHtml(p.correo_comprador || '—')}</dd>
+      <dt>Dirección</dt><dd>${pedidoDetalleDatosEditando ? `<input class="pedido-contact-input" id="pedido-contact-direccion" aria-label="Dirección de envío" maxlength="500" value="${escapeHtml(p.direccion_envio || '')}">` : escapeHtml(p.direccion_envio || '—')}</dd>
+      <dt>Entrega a</dt><dd>${escapeHtml(p.nombre_persona_entrega || '—')} (${escapeHtml(p.telefono_persona_entrega || '—')})</dd>
+      <dt>Fecha entrega</dt><dd>
+        ${pedidoDetalleEsSeguimiento(p)
+          ? `<input type="date" id="pedido-detalle-fecha-entrega" value="${p.fecha_entrega || ''}" class="entrega-input-detalle" title="Fecha de entrega">
+             <button class="btn btn-ghost btn-small" id="pedido-detalle-guardar-entrega" style="margin-left:8px;">Guardar</button>`
+          : escapeHtml(p.fecha_entrega || '—')
+        }
+      </dd>
+      <dt>Total</dt><dd id="pedido-detalle-total">$${Number(p.precio_compra_total || 0).toFixed(2)}</dd>
+    </dl>
+    <div class="pedido-contact-actions">
+      ${pedidoDetalleDatosEditando
+        ? `<button class="btn btn-ghost btn-small" id="pedido-cancelar-datos-btn">Cancelar</button><button class="btn btn-primary btn-small" id="pedido-guardar-datos-btn">Guardar datos</button>`
+        : `<button class="btn btn-ghost btn-small" id="pedido-editar-datos-btn"><i class="fa-solid fa-pen-to-square" aria-hidden="true"></i> Editar comprador, teléfono y dirección</button>`}
+    </div>
+  `;
+
+  if (!pedidoDetalleEditando){
+    body.innerHTML = `
+      ${cabecera}
+      <div class="compras-list">
+        <div class="compras-list-header">
+          <strong>Productos comprados</strong>
+          <button class="btn btn-ghost btn-small" id="pedido-editar-compras-btn">Editar productos</button>
+        </div>
+        ${compras.length ? `
+          <table>
+            <thead><tr><th>Producto</th><th>Cant.</th><th>Precio</th></tr></thead>
+            <tbody>
+              ${compras.map(c => `<tr><td>${escapeHtml(c.name || c.nombre || '—')}</td><td>${c.quantity ?? c.cantidad ?? 1}</td><td>$${Number(c.unitPrice ?? c.precio ?? 0).toFixed(2)}</td></tr>`).join('')}
+            </tbody>
+          </table>` : `<p class="hint">Este pedido no tiene productos registrados.</p>`}
+      </div>
+    `;
+    document.getElementById('pedido-editar-datos-btn')?.addEventListener('click', () => {
+      pedidoDetalleDatosEditando = true;
+      renderPedidoDetalleBody();
+    });
+    document.getElementById('pedido-cancelar-datos-btn')?.addEventListener('click', () => {
+      pedidoDetalleDatosEditando = false;
+      renderPedidoDetalleBody();
+    });
+    document.getElementById('pedido-guardar-datos-btn')?.addEventListener('click', guardarDatosCompradorPedido);
+    const editBtn = document.getElementById('pedido-editar-compras-btn');
+    if (editBtn) editBtn.addEventListener('click', iniciarEdicionComprasPedido);
+    // Guardar fecha de entrega desde el modal de detalle
+    const saveEntregaBtn = document.getElementById('pedido-detalle-guardar-entrega');
+    const entregaInput = document.getElementById('pedido-detalle-fecha-entrega');
+    if (saveEntregaBtn && entregaInput) {
+      saveEntregaBtn.addEventListener('click', async () => {
+        const id = pedidoDetalleActual.id;
+        const fecha = entregaInput.value; // YYYY-MM-DD o vacío
+        try {
+          await apiFetch(`/api/pedidos-asignados/${id}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ fecha_entrega: fecha || null })
+          });
+          // Actualizar estado local
+          const idx = state.pedidosSeguimiento.findIndex(x => x.id === id);
+          if (idx !== -1) state.pedidosSeguimiento[idx].fecha_entrega = fecha || null;
+          showToast('Fecha de entrega actualizada.');
+          renderPedidosSeguimiento();
+        } catch (err) {
+          showToast('Error actualizando fecha: ' + err.message, true);
+          // Revertir valor en el input
+          const pedido = state.pedidosSeguimiento.find(x => x.id === id);
+          entregaInput.value = pedido?.fecha_entrega || '';
+        }
+      });
+    }
+    return;
+  }
+
+  const totalEdit = totalComprasEdit();
+  body.innerHTML = `
+    ${cabecera}
+    <div class="compras-list compras-list-edit">
+      <div class="compras-list-header">
+        <strong>Editar productos</strong>
+        <button class="btn btn-ghost btn-small" id="pedido-agregar-producto-btn" ${state.productos.length ? '' : 'disabled'}>+ Agregar producto</button>
+      </div>
+      ${!state.productos.length ? `<p class="hint err">No se pudo cargar el inventario para editar productos.</p>` : ''}
+      <table class="pedido-edit-table">
+        <thead><tr><th>Producto</th><th>Cant.</th><th>Precio unit.</th><th>Subtotal</th><th></th></tr></thead>
+        <tbody id="pedido-edit-tbody">
+          ${pedidoDetalleComprasEdit.map((c, idx) => filaEdicionPedidoHtml(c, idx)).join('') || `<tr><td colspan="5" class="hint">Sin productos. Usa "Agregar producto" para añadir uno.</td></tr>`}
+        </tbody>
+      </table>
+      <div class="compras-edit-total">Total: <strong id="pedido-edit-total">$${totalEdit.toFixed(2)}</strong></div>
+      <div class="compras-edit-actions">
+        <button class="btn btn-ghost btn-small" id="pedido-cancelar-edicion-btn">Cancelar</button>
+        <button class="btn btn-primary btn-small" id="pedido-guardar-edicion-btn">Guardar cambios</button>
+      </div>
+    </div>
+  `;
+
+  document.getElementById('pedido-agregar-producto-btn')?.addEventListener('click', agregarProductoAEdicionPedido);
+  document.getElementById('pedido-cancelar-edicion-btn')?.addEventListener('click', () => {
+    pedidoDetalleEditando = false;
+    renderPedidoDetalleBody();
+  });
+  document.getElementById('pedido-guardar-edicion-btn')?.addEventListener('click', guardarEdicionComprasPedido);
+
+  bindFilaEdicionPedidoEventos();
+}
+
+function filaEdicionPedidoHtml(c, idx){
+  const subtotal = (Number(c.unitPrice) || 0) * (Number(c.quantity) || 0);
+  return `
+    <tr data-row="${idx}">
+      <td data-label="Producto">
+        <div class="autocomplete-wrap" data-idx="${idx}">
+          <input type="text" class="pedido-edit-product-input" data-idx="${idx}" value="${escapeHtml(c.name || '')}" placeholder="Buscar producto..." autocomplete="off" autocapitalize="off" spellcheck="false">
+          <div class="autocomplete-list" data-idx="${idx}" hidden></div>
+        </div>
+      </td>
+      <td data-label="Cantidad"><input type="number" min="1" step="1" inputmode="numeric" class="pedido-edit-qty" data-idx="${idx}" value="${Number(c.quantity) || 1}"></td>
+      <td data-label="Precio unit."><input type="number" min="0" step="0.01" inputmode="decimal" class="pedido-edit-price" data-idx="${idx}" value="${Number(c.unitPrice) || 0}"></td>
+      <td class="pedido-edit-subtotal" data-idx="${idx}" data-label="Subtotal">$${subtotal.toFixed(2)}</td>
+      <td data-label=""><button type="button" class="icon-btn" title="Quitar producto" aria-label="Quitar producto de la lista" data-remove-row="${idx}"><i class="fa-solid fa-trash-can"></i></button></td>
+    </tr>`;
+}
+
+function actualizarFilaEdicionPedido(idx){
+  const c = pedidoDetalleComprasEdit[idx];
+  if (!c) return;
+  const subtotal = (Number(c.unitPrice) || 0) * (Number(c.quantity) || 0);
+  const celda = document.querySelector(`.pedido-edit-subtotal[data-idx="${idx}"]`);
+  if (celda) celda.textContent = `$${subtotal.toFixed(2)}`;
+  const totalEl = document.getElementById('pedido-edit-total');
+  if (totalEl) totalEl.textContent = `$${totalComprasEdit().toFixed(2)}`;
+}
+
+function bindFilaEdicionPedidoEventos(){
+  const body = document.getElementById('pedido-detalle-body');
+  if (!body) return;
+
+  body.querySelectorAll('.pedido-edit-qty').forEach(inp => {
+    inp.addEventListener('input', (e) => {
+      const idx = Number(e.target.dataset.idx);
+      pedidoDetalleComprasEdit[idx].quantity = Math.max(1, Math.floor(Number(e.target.value) || 1));
+      actualizarFilaEdicionPedido(idx);
+    });
+  });
+
+  body.querySelectorAll('.pedido-edit-price').forEach(inp => {
+    inp.addEventListener('input', (e) => {
+      const idx = Number(e.target.dataset.idx);
+      pedidoDetalleComprasEdit[idx].unitPrice = Math.max(0, Number(e.target.value) || 0);
+      actualizarFilaEdicionPedido(idx);
+    });
+  });
+
+  body.querySelectorAll('[data-remove-row]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      const idx = Number(e.currentTarget.dataset.removeRow);
+      pedidoDetalleComprasEdit.splice(idx, 1);
+      renderPedidoDetalleBody();
+    });
+  });
+
+  body.querySelectorAll('.pedido-edit-product-input').forEach(inp => {
+    const idx = Number(inp.dataset.idx);
+    const lista = body.querySelector(`.autocomplete-list[data-idx="${idx}"]`);
+    if (!lista) return;
+
+    const mostrarSugerencias = () => {
+      const query = normalizeText(inp.value.trim());
+      const productos = query
+        ? state.productos.filter(p => normalizeText(p.nombre).includes(query))
+        : state.productos;
+      const top = productos.slice(0, 8);
+      if (!top.length){
+        lista.innerHTML = `<div class="autocomplete-empty">Sin coincidencias</div>`;
+      } else {
+        lista.innerHTML = top.map((p, i) => `
+          <button type="button" class="autocomplete-item${i === 0 ? ' active' : ''}" data-idx="${idx}" data-prod-id="${escapeHtml(String(p.id))}">
+            <span class="autocomplete-item-name">${escapeHtml(p.nombre)}</span>
+            <span class="autocomplete-item-price">$${Number(p.precio || 0).toFixed(2)}</span>
+          </button>`).join('');
+      }
+      lista.hidden = false;
+    };
+
+    const elegirProducto = (prodId) => {
+      const prod = state.productos.find(p => String(p.id) === String(prodId));
+      if (!prod) return;
+      pedidoDetalleComprasEdit[idx] = {
+        ...pedidoDetalleComprasEdit[idx],
+        id: prod.id,
+        name: prod.nombre,
+        unitPrice: Number(prod.oferta && Number(prod.descuento) > 0
+          ? Number(prod.precio) * (1 - Number(prod.descuento) / 100)
+          : prod.precio) || 0,
+        listPrice: Number(prod.precio) || 0,
+        discount: prod.oferta ? Number(prod.descuento) || 0 : 0
+      };
+      inp.value = prod.nombre;
+      const precioInput = body.querySelector(`.pedido-edit-price[data-idx="${idx}"]`);
+      if (precioInput) precioInput.value = pedidoDetalleComprasEdit[idx].unitPrice;
+      actualizarFilaEdicionPedido(idx);
+      lista.hidden = true;
+      lista.innerHTML = '';
+    };
+
+    inp.addEventListener('focus', mostrarSugerencias);
+    inp.addEventListener('input', mostrarSugerencias);
+
+    inp.addEventListener('keydown', (e) => {
+      const items = Array.from(lista.querySelectorAll('.autocomplete-item'));
+      if (!items.length) return;
+      let activeIdx = items.findIndex(it => it.classList.contains('active'));
+      if (e.key === 'ArrowDown'){
+        e.preventDefault();
+        activeIdx = (activeIdx + 1) % items.length;
+        items.forEach(it => it.classList.remove('active'));
+        items[activeIdx].classList.add('active');
+      } else if (e.key === 'ArrowUp'){
+        e.preventDefault();
+        activeIdx = (activeIdx - 1 + items.length) % items.length;
+        items.forEach(it => it.classList.remove('active'));
+        items[activeIdx].classList.add('active');
+      } else if (e.key === 'Enter'){
+        e.preventDefault();
+        const activo = items[activeIdx] || items[0];
+        if (activo) elegirProducto(activo.dataset.prodId);
+      } else if (e.key === 'Escape'){
+        lista.hidden = true;
+      }
+    });
+
+    inp.addEventListener('blur', () => {
+      setTimeout(() => { lista.hidden = true; lista.innerHTML = ''; }, 150);
+    });
+
+    lista.querySelectorAll('.autocomplete-item').forEach(btn => {
+      btn.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        elegirProducto(btn.dataset.prodId);
+      });
+    });
+
+    lista.addEventListener('mousedown', (e) => {
+      const btn = e.target.closest('.autocomplete-item');
+      if (btn) { e.preventDefault(); elegirProducto(btn.dataset.prodId); }
+    });
+  });
+}
+
+async function iniciarEdicionComprasPedido(){
+  if (!state.productos.length){
+    try{ await loadProductos(); }catch(e){ showToast('No se pudo cargar el inventario: ' + e.message, true); }
+  }
+  const compras = Array.isArray(pedidoDetalleActual.compras) ? pedidoDetalleActual.compras : [];
+  pedidoDetalleComprasEdit = compras.map(c => ({
+    id: c.id ?? c.productId ?? c.product_id ?? null,
+    name: c.name || c.nombre || 'Producto',
+    unitPrice: Number(c.unitPrice ?? c.precio ?? 0) || 0,
+    listPrice: Number(c.listPrice ?? c.unitPrice ?? c.precio ?? 0) || 0,
+    discount: Number(c.discount || 0) || 0,
+    quantity: Number(c.quantity ?? c.cantidad ?? 1) || 1,
+    // Conserva si el ítem era un pack: el backend lo usa para restaurar stock
+    // y recalcular el precio correctamente al guardar.
+    type: c.type || (c.isPack || c.pack ? 'pack' : 'product')
+  }));
+  pedidoDetalleEditando = true;
+  renderPedidoDetalleBody();
+}
+
+function agregarProductoAEdicionPedido(){
+  pedidoDetalleComprasEdit.push({ id: null, name: '', unitPrice: 0, quantity: 1 });
+  renderPedidoDetalleBody();
+  const tbody = document.getElementById('pedido-edit-tbody');
+  const filas = tbody ? tbody.querySelectorAll('.pedido-edit-product-input') : [];
+  const ultimo = filas[filas.length - 1];
+  if (ultimo) ultimo.focus();
+}
+
+async function guardarEdicionComprasPedido(){
+  try{
+    const sinProducto = pedidoDetalleComprasEdit.some(c => !c.id || !c.name);
+    if (sinProducto){
+      showToast('Selecciona un producto de la lista para cada fila antes de guardar.', true);
+      return;
+    }
+    const compras = pedidoDetalleComprasEdit
+      .filter(c => (Number(c.quantity) || 0) > 0)
+      .map(c => ({
+        id: c.id,
+        name: c.name,
+        unitPrice: Number(c.unitPrice) || 0,
+        listPrice: Number(c.listPrice ?? c.unitPrice) || 0,
+        discount: Number(c.discount) || 0,
+        quantity: Number(c.quantity) || 0,
+        type: c.type || 'product'
+      }));
+
+    const data = await apiFetch(endpointPedidoDetalle(), { method: 'PATCH', body: JSON.stringify({ compras }) });
+    const actualizado = data.pedido;
+    if (!actualizado) throw new Error('El servidor no devolvió el pedido actualizado.');
+
+    const listaKey = pedidoDetalleEsSeguimiento(pedidoDetalleActual) ? 'pedidosSeguimiento' : 'pedidosNuevos';
+    const idx = state[listaKey].findIndex(x => x.id === pedidoDetalleActual.id);
+    if (idx !== -1) state[listaKey][idx] = actualizado;
+
+    pedidoDetalleActual = actualizado;
+    pedidoDetalleEditando = false;
+    renderPedidoDetalleBody();
+
+    if (listaKey === 'pedidosNuevos') renderPedidosNuevos();
+    else { renderPedidosGuardados(); renderPedidosSeguimiento(); }
+    actualizarBadgesPedidos();
+
+    showToast('Pedido actualizado.');
+  }catch(e){ showToast('Error guardando cambios: ' + e.message, true); }
+}
+
+async function guardarDatosCompradorPedido(){
+  const payload = {
+    nombre_comprador: document.getElementById('pedido-contact-nombre')?.value || '',
+    telefono_comprador: document.getElementById('pedido-contact-telefono')?.value || '',
+    direccion_envio: document.getElementById('pedido-contact-direccion')?.value || ''
+  };
+  try{
+    const data = await apiFetch(endpointPedidoDetalle(), { method: 'PATCH', body: JSON.stringify(payload) });
+    if (!data.pedido) throw new Error('El servidor no devolvió el pedido actualizado.');
+    const actualizado = data.pedido;
+    const listaKey = pedidoDetalleEsSeguimiento(pedidoDetalleActual) ? 'pedidosSeguimiento' : 'pedidosNuevos';
+    const idx = state[listaKey].findIndex(x => x.id === pedidoDetalleActual.id);
+    if (idx !== -1) state[listaKey][idx] = actualizado;
+    pedidoDetalleActual = actualizado;
+    pedidoDetalleDatosEditando = false;
+    renderPedidoDetalleBody();
+    renderPedidosNuevos();
+    renderPedidosGuardados();
+    renderPedidosSeguimiento();
+    showToast('Datos del comprador actualizados.');
+  }catch(e){ showToast('Error guardando datos: ' + e.message, true); }
+}
+
+async function loadUsuarios(force = false){
+  try{
+    const data = await apiFetch('/obtener-estadisticas', { force });
+    const usuarios = Array.isArray(data) ? data : [];
+    state.usuarios = usuarios
+      .filter(u => u && typeof u === 'object')
+      .sort((a, b) => {
+        const da = new Date(a.fecha_hora_entrada || 0).getTime();
+        const db = new Date(b.fecha_hora_entrada || 0).getTime();
+        return db - da;
+      });
+    state.usuariosPage = 1;
+    renderUsuarios();
+  }catch(e){ showToast('Error cargando estadísticas: ' + e.message, true); }
+}
+
+function getFilteredUsuarios(){
+  const query = normalizeText(state.usuariosQuery);
+  const source = state.usuarios || [];
+  if (!query) return source;
+
+  return source.filter(u => {
+    const haystack = normalizeText([
+      u.fecha_hora_entrada,
+      u.ip,
+      u.pais,
+      u.tipo_usuario,
+      u.origen,
+      u.fuente_trafico,
+      u.navegador,
+      u.sistema_operativo
+    ].filter(Boolean).join(' '));
+    return haystack.includes(query);
+  });
+}
+
+function renderUsuarios(){
+  const tbody = document.getElementById('usr-tbody');
+  const empty = document.getElementById('usr-empty');
+  const summary = document.getElementById('usr-summary');
+  const loadMoreBtn = document.getElementById('usr-load-more');
+  const totalEl = document.getElementById('usr-total-count');
+  const recurrentEl = document.getElementById('usr-recurrent-count');
+  const uniqueEl = document.getElementById('usr-unique-count');
+
+  if (!tbody) return;
+
+  const filtered = getFilteredUsuarios();
+  const total = filtered.length;
+  const visibleCount = Math.min(state.usuariosPage * state.usuariosPageSize, total);
+  const list = filtered.slice(0, visibleCount);
+
+  tbody.innerHTML = '';
+
+  list.forEach(u => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${escapeHtml(u.fecha_hora_entrada || '—')}</td>
+      <td>${escapeHtml(u.ip || '—')}</td>
+      <td>${escapeHtml(u.pais || '—')}</td>
+      <td>${u.tipo_usuario === 'Recurrente' ? `<span class="pill pill-warn">⏳ Recurrente</span>` : `<span class="pill pill-yes">✓ Único</span>`}</td>
+      <td>${escapeHtml(u.origen || u.fuente_trafico || '—')}</td>
+      <td>${escapeHtml(u.navegador || '—')}</td>
+      <td>${escapeHtml(u.sistema_operativo || '—')}</td>`;
+    tbody.appendChild(tr);
+  });
+
+  const recurrentes = filtered.filter(u => String(u.tipo_usuario || '').toLowerCase() === 'recurrente').length;
+  const unicos = filtered.filter(u => String(u.tipo_usuario || '').toLowerCase() !== 'recurrente').length;
+
+  if (summary) summary.textContent = total ? `Mostrando ${list.length} de ${total} registros.` : 'Sin resultados para esta búsqueda.';
+  if (totalEl) totalEl.textContent = String(total);
+  if (recurrentEl) recurrentEl.textContent = String(recurrentes);
+  if (uniqueEl) uniqueEl.textContent = String(unicos);
+  if (empty) empty.hidden = list.length !== 0 || total !== 0;
+
+  if (loadMoreBtn) {
+    const hasMore = visibleCount < total;
+    loadMoreBtn.hidden = !hasMore;
+    loadMoreBtn.disabled = !hasMore;
+    loadMoreBtn.textContent = hasMore ? 'Cargar más' : 'No hay más registros';
+  }
+}
+
+document.getElementById('usr-refresh').addEventListener('click', () => loadUsuarios(true));
+document.getElementById('usr-load-more')?.addEventListener('click', () => {
+  const filtered = getFilteredUsuarios();
+  if (state.usuariosPage * state.usuariosPageSize < filtered.length) {
+    state.usuariosPage += 1;
+    renderUsuarios();
+  }
+});
+document.getElementById('usr-search')?.addEventListener('input', debounce((event) => {
+  state.usuariosQuery = event.target.value;
+  state.usuariosPage = 1;
+  renderUsuarios();
+}, 150));
+
+/* --------------------- Limpiar el registro de estadísticas ---------------------
+   Borra SOLO el nodo /estadisticas de la RTDB secundaria (registro de visitas).
+   El backend no toca /pedidos, /pedidos_asignados, /known_ips ni el catálogo, así
+   que los pedidos, clientes, inventario e ingresos quedan intactos. */
+let limpiandoEstadisticas = false;
+
+async function limpiarEstadisticas(){
+  if (limpiandoEstadisticas) return;
+  const total = Array.isArray(state.usuarios) ? state.usuarios.length : 0;
+  if (total === 0){
+    showToast('No hay registros de estadísticas que borrar.');
+    return;
+  }
+
+  const confirmado = confirm(
+    `Se eliminarán ${total} registro(s) de visitas del nodo /estadisticas (base de datos secundaria).\n\n` +
+    'NO se borra nada más: pedidos, clientes, inventario, packs, ingresos ni el historial de IPs.\n\n' +
+    'Esta acción no se puede deshacer. ¿Continuar?'
+  );
+  if (!confirmado) return;
+
+  limpiandoEstadisticas = true;
+  const btn = document.getElementById('usr-clear-stats');
+  const textoOriginal = btn ? btn.innerHTML : '';
+  if (btn){ btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Limpiando...'; }
+
+  try{
+    const data = await apiFetch('/api/clear-statistics', { method: 'POST' });
+    state.usuarios = [];
+    state.usuariosPage = 1;
+    state.usuariosQuery = '';
+    const search = document.getElementById('usr-search');
+    if (search) search.value = '';
+    renderUsuarios();
+    showToast((data && data.message) || 'Estadísticas limpiadas correctamente.');
+    // Resumen también lee /estadisticas (tarjeta "Usuarios registrados" y el
+    // gráfico de horas), así que hay que refrescarlo para que no muestre nada viejo.
+    await loadResumen().catch(() => {});
+  }catch(e){
+    showToast('Error limpiando estadísticas: ' + e.message, true);
+  }finally{
+    limpiandoEstadisticas = false;
+    if (btn){ btn.disabled = false; btn.innerHTML = textoOriginal; }
+  }
+}
+
+document.getElementById('usr-clear-stats')?.addEventListener('click', limpiarEstadisticas);
+
+/* ------------------------- Pestañas Visitas / Clientes ------------------------- */
+
+document.querySelectorAll('#usr-tabs .seg-tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const tab = btn.dataset.utab;
+    document.querySelectorAll('#usr-tabs .seg-tab').forEach(b => b.classList.toggle('active', b === btn));
+    document.getElementById('usr-panel-visitas').classList.toggle('active', tab === 'visitas');
+    document.getElementById('usr-panel-clientes').classList.toggle('active', tab === 'clientes');
+    if (tab === 'clientes') renderClientes();
+  });
+});
+
+/* --------------------- Clientes que compraron (según pedidos) --------------------- */
+// Agrupa todos los pedidos (nuevos + en seguimiento) por cliente usando la misma
+// lógica de "mismo comprador" ya usada para detectar reincidentes, para armar
+// un listado de clientes con lo que ha comprado cada uno.
+
+let clientesFiltradosActuales = [];
+
+function buildClientesFromPedidos(){
+  const todos = [...state.pedidosNuevos, ...state.pedidosSeguimiento];
+  const grupos = [];
+
+  todos.forEach(p => {
+    const grupo = grupos.find(g => g.pedidos.some(existente => ordersBelongToSameUser(existente, p)));
+    if (grupo) grupo.pedidos.push(p);
+    else grupos.push({ pedidos: [p] });
+  });
+
+  return grupos.map(g => {
+    const pedidos = g.pedidos.slice().sort((a, b) => (parseFechaPedidoLocal(getPedidoFecha(b))?.getTime() || 0) - (parseFechaPedidoLocal(getPedidoFecha(a))?.getTime() || 0));
+    const masReciente = pedidos[0];
+    const totalGastado = pedidos.reduce((acc, p) => acc + Number(p.precio_compra_total || 0), 0);
+
+    const productosMap = new Map();
+    pedidos.forEach(p => {
+      const compras = Array.isArray(p.compras) ? p.compras : [];
+      compras.forEach(c => {
+        const nombre = c.name || c.nombre || 'Producto sin nombre';
+        const cantidad = Number(c.quantity ?? c.cantidad ?? 1) || 0;
+        const importe = (Number(c.unitPrice ?? c.precio ?? 0) || 0) * cantidad;
+        const actual = productosMap.get(nombre) || { cantidad: 0, importe: 0 };
+        actual.cantidad += cantidad;
+        actual.importe += importe;
+        productosMap.set(nombre, actual);
+      });
+    });
+
+    return {
+      nombre: masReciente.nombre_comprador || 'Sin nombre',
+      telefono: masReciente.telefono_comprador || '',
+      correo: masReciente.correo_comprador || '',
+      direccion: masReciente.direccion_envio || '',
+      ultimaFecha: getPedidoFecha(masReciente),
+      totalPedidos: pedidos.length,
+      totalGastado,
+      pedidos,
+      productos: Array.from(productosMap.entries())
+        .map(([nombre, v]) => ({ nombre, cantidad: v.cantidad, importe: v.importe }))
+        .sort((a, b) => b.cantidad - a.cantidad)
+    };
+  });
+}
+
+async function loadClientes(force = false){
+  try{
+    await loadPedidosSection(force);
+    state.clientes = buildClientesFromPedidos();
+    renderClientes();
+  }catch(e){ showToast('Error cargando clientes: ' + e.message, true); }
+}
+
+function getFilteredClientes(){
+  const query = normalizeText(state.clientesQuery);
+  const source = state.clientes || [];
+  if (!query) return source;
+  return source.filter(c => {
+    const productos = c.productos.map(p => p.nombre).join(' ');
+    const haystack = normalizeText([c.nombre, c.telefono, c.correo, c.direccion, productos].filter(Boolean).join(' '));
+    return haystack.includes(query);
+  });
+}
+
+function renderClientes(){
+  const tbody = document.getElementById('cli-tbody');
+  const empty = document.getElementById('cli-empty');
+  const summary = document.getElementById('cli-summary');
+  if (!tbody) return;
+
+  const filtered = getFilteredClientes().slice().sort((a, b) => b.totalGastado - a.totalGastado);
+  clientesFiltradosActuales = filtered;
+
+  tbody.innerHTML = filtered.map((c, idx) => `
+    <tr data-cli-idx="${idx}">
+      <td data-label="Cliente">${escapeHtml(c.nombre)}</td>
+      <td data-label="Teléfono">${escapeHtml(c.telefono || '—')}</td>
+      <td data-label="Correo">${escapeHtml(c.correo || '—')}</td>
+      <td data-label="Pedidos">${c.totalPedidos}</td>
+      <td data-label="Total gastado">$${c.totalGastado.toFixed(2)}</td>
+      <td data-label="Última compra">${c.ultimaFecha ? new Date(c.ultimaFecha).toLocaleDateString() : '—'}</td>
+      <td data-label="Acciones"><button class="btn btn-ghost btn-small" data-cli-ver="${idx}" type="button">Ver detalle</button></td>
+    </tr>`).join('');
+
+  if (summary) summary.textContent = filtered.length ? `Mostrando ${filtered.length} cliente(s).` : 'Sin resultados para esta búsqueda.';
+  if (empty) empty.hidden = filtered.length !== 0;
+
+  const totalPedidos = filtered.reduce((acc, c) => acc + c.totalPedidos, 0);
+  const totalIngresos = filtered.reduce((acc, c) => acc + c.totalGastado, 0);
+  setText('cli-total-count', String(filtered.length));
+  setText('cli-pedidos-total', String(totalPedidos));
+  setText('cli-ingresos-total', '$' + totalIngresos.toFixed(2));
+}
+
+function exportarClientesCSV(){
+  const headers = ['Cliente', 'Teléfono', 'Correo', 'Pedidos', 'Total gastado', 'Última compra'];
+  const rows = clientesFiltradosActuales.map(c => [
+    c.nombre || '',
+    c.telefono || '',
+    c.correo || '',
+    c.totalPedidos,
+    c.totalGastado.toFixed(2),
+    c.ultimaFecha ? new Date(c.ultimaFecha).toLocaleDateString() : ''
+  ]);
+  exportarCSV(headers, rows, `clientes-buquenque-${new Date().toISOString().slice(0, 10)}.csv`);
+}
+
+const btnExportClientes = document.getElementById('cli-export-csv');
+if (btnExportClientes) btnExportClientes.addEventListener('click', exportarClientesCSV);
+
+document.getElementById('cli-tbody')?.addEventListener('click', (event) => {
+  const btn = event.target.closest('[data-cli-ver]');
+  const row = event.target.closest('[data-cli-idx]');
+  const idx = btn ? btn.dataset.cliVer : (row ? row.dataset.cliIdx : null);
+  if (idx === null || idx === undefined) return;
+  const cliente = clientesFiltradosActuales[Number(idx)];
+  if (cliente) showClienteDetalle(cliente);
+});
+
+document.getElementById('cli-search')?.addEventListener('input', debounce((event) => {
+  state.clientesQuery = event.target.value;
+  renderClientes();
+}, 150));
+document.getElementById('cli-refresh')?.addEventListener('click', () => loadClientes(true));
+
+let clienteDetalleActual = null;
+let clienteDetallePedidoId = null;
+let clienteDetalleTab = 'pedidos';
+
+function showClienteDetalle(c){
+  clienteDetalleActual = c;
+  clienteDetallePedidoId = c.pedidos.length ? getOriginalPedidoId(c.pedidos[0]) : null;
+  clienteDetalleTab = 'pedidos';
+  renderClienteDetalleBody();
+  openModal('modal-cliente');
+}
+
+function renderClientePedidoPreview(p){
+  if (!p) return `<p class="hint">Este cliente no tiene pedidos.</p>`;
+  const compras = Array.isArray(p.compras) ? p.compras : [];
+  return `
+    <div class="cli-pedido-preview-header">
+      <div>
+        <strong>Orden ${escapeHtml(getPedidoNumero(p) || '—')}</strong>
+        <span class="hint">${escapeHtml(parseFechaPedidoLocal(getPedidoFecha(p))?.toLocaleString() || '—')}</span>
+      </div>
+      <button class="btn btn-ghost btn-small" id="cli-pedido-abrir-completo" type="button">Abrir pedido completo</button>
+    </div>
+    ${compras.length ? `
+      <table>
+        <thead><tr><th>Producto</th><th>Cant.</th><th>Precio</th></tr></thead>
+        <tbody>
+          ${compras.map(item => `<tr><td>${escapeHtml(item.name || item.nombre || '—')}</td><td>${item.quantity ?? item.cantidad ?? 1}</td><td>$${Number(item.unitPrice ?? item.precio ?? 0).toFixed(2)}</td></tr>`).join('')}
+        </tbody>
+      </table>` : `<p class="hint">Este pedido no tiene productos registrados.</p>`}
+    <div class="cli-pedido-preview-total">Total: <strong>$${Number(p.precio_compra_total || 0).toFixed(2)}</strong></div>
+  `;
+}
+
+function renderClienteDetalleBody(){
+  const body = document.getElementById('cliente-detalle-body');
+  const c = clienteDetalleActual;
+  if (!c || !body) return;
+
+  const pedidoSeleccionado = c.pedidos.find(p => getOriginalPedidoId(p) === clienteDetallePedidoId) || c.pedidos[0] || null;
+
+  body.innerHTML = `
+    <dl class="detail-grid">
+      <dt>Cliente</dt><dd>${escapeHtml(c.nombre)}</dd>
+      <dt>Teléfono</dt><dd>${escapeHtml(c.telefono || '—')}</dd>
+      <dt>Correo</dt><dd>${escapeHtml(c.correo || '—')}</dd>
+      <dt>Dirección</dt><dd>${escapeHtml(c.direccion || '—')}</dd>
+      <dt>Pedidos</dt><dd>${c.totalPedidos}</dd>
+      <dt>Total gastado</dt><dd>$${c.totalGastado.toFixed(2)}</dd>
+    </dl>
+
+    <div class="seg-tabs nested" id="cli-detalle-tabs">
+      <button class="seg-tab ${clienteDetalleTab === 'pedidos' ? 'active' : ''}" data-cdtab="pedidos">Pedidos <span class="seg-tab-count">${c.totalPedidos}</span></button>
+      <button class="seg-tab ${clienteDetalleTab === 'productos' ? 'active' : ''}" data-cdtab="productos">Productos comprados</button>
+    </div>
+
+    <div class="tab-panel ${clienteDetalleTab === 'pedidos' ? 'active' : ''}" id="cli-detalle-panel-pedidos">
+      <div class="cli-pedidos-split">
+        <div class="cli-pedidos-list-col">
+          ${c.pedidos.map(p => {
+            const pid = getOriginalPedidoId(p);
+            const activo = pid === clienteDetallePedidoId;
+            return `
+            <div class="mini-row cli-pedido-item${activo ? ' active' : ''}" data-cli-pedido="${pid}">
+              <span class="k">${escapeHtml(parseFechaPedidoLocal(getPedidoFecha(p))?.toLocaleDateString() || '—')} · Orden ${escapeHtml(getPedidoNumero(p) || '—')}</span>
+              <span class="v">$${Number(p.precio_compra_total || 0).toFixed(2)}</span>
+            </div>`;
+          }).join('') || `<p class="hint">Este cliente no tiene pedidos.</p>`}
+        </div>
+        <div class="cli-pedido-preview" id="cli-pedido-preview">
+          ${renderClientePedidoPreview(pedidoSeleccionado)}
+        </div>
+      </div>
+    </div>
+
+    <div class="tab-panel ${clienteDetalleTab === 'productos' ? 'active' : ''}" id="cli-detalle-panel-productos">
+      ${c.productos.length ? `
+        <div class="cli-productos-scroll">
+          <table class="cli-productos-table">
+            <thead><tr><th>Producto</th><th>Cant. total</th><th>Importe</th></tr></thead>
+            <tbody>
+              ${c.productos.map(p => `<tr><td>${escapeHtml(p.nombre)}</td><td>${p.cantidad}</td><td>$${p.importe.toFixed(2)}</td></tr>`).join('')}
+            </tbody>
+          </table>
+        </div>` : `<p class="hint">Sin productos registrados.</p>`}
+    </div>
+  `;
+
+  body.querySelectorAll('#cli-detalle-tabs .seg-tab').forEach(btn => {
+    btn.addEventListener('click', () => {
+      clienteDetalleTab = btn.dataset.cdtab;
+      renderClienteDetalleBody();
+    });
+  });
+
+  body.querySelectorAll('[data-cli-pedido]').forEach(row => {
+    row.addEventListener('click', () => {
+      clienteDetallePedidoId = row.dataset.cliPedido;
+      renderClienteDetalleBody();
+    });
+  });
+
+  const abrirBtn = document.getElementById('cli-pedido-abrir-completo');
+  if (abrirBtn){
+    abrirBtn.addEventListener('click', () => {
+      const pedido = c.pedidos.find(x => getOriginalPedidoId(x) === clienteDetallePedidoId);
+      if (pedido){
+        closeModal('modal-cliente');
+        showPedidoDetalle(pedido);
+      }
+    });
+  }
+}
+
+/* --------------------------------- Utils --------------------------------- */
+
+function escapeHtml(str){
+  if (str === undefined || str === null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// El backend guarda fecha_creacion / fecha_actualizacion como
+// "yyyy-MM-dd HH:mm:ss" ya en hora de La Habana. Se formatea sin pasar por
+// Date() para no reinterpretarla con el timezone del navegador.
+function formatFechaCorta(fecha){
+  if (!fecha) return '—';
+  const match = String(fecha).match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+  if (!match) return String(fecha);
+  const [, y, m, d, h, min] = match;
+  return `${d}/${m}/${y} ${h}:${min}`;
+}
+
+/* ------------------------------- Autenticación -------------------------------- */
+// Este panel corre en un dominio distinto al backend (GitHub Pages vs.
+// Render), así que necesita iniciar sesión igual que el panel de
+// administración: la sesión viaja como cookie cross-site (requiere
+// `credentials: 'include'` en cada fetch, ya aplicado en apiFetch).
+
+async function checkAuth(){
+  if (!apiUrlOk()) return false;
+  if (!state.authToken) return false; // sin token guardado no hay sesión válida (no confiamos solo en la cookie por iOS)
+  try {
+    const base = state.apiUrl.replace(/\/$/, '');
+    const res = await fetch(base + '/api/auth/me', { credentials: 'include', headers: authHeaders() });
+    const data = await res.json();
+    if (!(data && data.authenticated)) setAuthToken(null);
+    return !!(data && data.authenticated);
+  } catch (e) {
+    return false;
+  }
+}
+
+const PRESENCE_DEVICE_KEY = 'analytics_presence_device_id';
+const PRESENCE_HEARTBEAT_MS = 25000;
+let presenceSessionId = null;
+let presenceHeartbeatTimer = null;
+let presenceStarted = false;
+let presenceRequestInFlight = false;
+let presenceVisibilityHandler = null;
+
+function getPresenceDeviceId(){
+  let id = localStorage.getItem(PRESENCE_DEVICE_KEY);
+  if (!id){
+    id = window.crypto?.randomUUID
+      ? window.crypto.randomUUID()
+      : `device-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    localStorage.setItem(PRESENCE_DEVICE_KEY, id);
+  }
+  return id;
+}
+
+function getPresenceSessionId(){
+  if (!presenceSessionId) {
+    presenceSessionId = window.crypto?.randomUUID
+      ? window.crypto.randomUUID()
+      : `session-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+  return presenceSessionId;
+}
+
+function renderPresenceCount(count){
+  document.querySelectorAll('[data-presence-count]').forEach(el => {
+    el.textContent = String(count);
+  });
+}
+
+async function sendAnalyticsPresence(action = 'heartbeat'){
+  if (!apiUrlOk() || !state.authToken || presenceRequestInFlight) return;
+  if (action === 'heartbeat' && document.visibilityState === 'hidden') return;
+  presenceRequestInFlight = true;
+  try{
+    const base = state.apiUrl.replace(/\/$/, '');
+    const response = await fetch(base + '/api/admin/analytics-presence', {
+      method: 'POST',
+      credentials: 'include',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ deviceId: getPresenceDeviceId(), sessionId: getPresenceSessionId(), action })
+    });
+    if (response.status === 401){
+      setAuthToken(null);
+      lockApp();
+      showAuthGate();
+      return;
+    }
+    if (!response.ok) return;
+    const data = await response.json();
+    if (Number.isFinite(Number(data.activeSessions))) renderPresenceCount(data.activeSessions);
+  }catch(e){
+    // Las sesiones inactivas caducan en el servidor; un fallo de presencia no afecta al panel.
+  }finally{
+    presenceRequestInFlight = false;
+  }
+}
+
+function startAnalyticsPresence(){
+  if (presenceStarted || !state.authenticated || !apiUrlOk()) return;
+  presenceStarted = true;
+  sendAnalyticsPresence();
+  presenceHeartbeatTimer = setInterval(() => sendAnalyticsPresence(), PRESENCE_HEARTBEAT_MS);
+  presenceVisibilityHandler = () => {
+    if (document.visibilityState === 'visible') sendAnalyticsPresence();
+  };
+  document.addEventListener('visibilitychange', presenceVisibilityHandler);
+}
+
+function stopAnalyticsPresence(){
+  if (!presenceStarted) return;
+  presenceStarted = false;
+  clearInterval(presenceHeartbeatTimer);
+  presenceHeartbeatTimer = null;
+  if (presenceVisibilityHandler){
+    document.removeEventListener('visibilitychange', presenceVisibilityHandler);
+    presenceVisibilityHandler = null;
+  }
+  sendAnalyticsPresence('leave');
+}
+
+/* --- Bloqueo real del panel ------------------------------------------------
+   El panel completo (sidebar, vistas, datos) arranca con la clase "locked"
+   puesta directamente en el HTML, que lo pone en display:none. Esa clase
+   SOLO se quita desde unlockApp(), que solo se llama tras un login válido
+   contra el backend. Así, aunque alguien abra devtools y borre a mano el
+   overlay de login (o le cambie el CSS), no hay nada debajo que mostrar: el
+   contenedor .app sigue oculto y goToView() sigue rechazando la navegación
+   porque state.authenticated sigue en false.
+
+   Importante: esto es una barrera de interfaz, pensada para que no se pueda
+   "colar" con un truco de un clic en el navegador. La seguridad real de los
+   datos la sigue dando el backend (cookie de sesión + verificación en cada
+   endpoint) — eso no cambia y sigue siendo indispensable. */
+
+function lockApp(){
+  state.authenticated = false;
+  stopAnalyticsPresence();
+  const appEl = document.querySelector('.app');
+  if (appEl) appEl.classList.add('locked');
+}
+
+function unlockApp(){
+  state.authenticated = true;
+  const appEl = document.querySelector('.app');
+  if (appEl) appEl.classList.remove('locked');
+  startAnalyticsPresence();
+  requestAnimationFrame(refreshAllSegTabsFade);
+}
+
+function showBackendGate(){
+  const gate = document.getElementById('backend-gate');
+  if (gate) gate.classList.add('open');
+}
+
+function hideBackendGate(){
+  const gate = document.getElementById('backend-gate');
+  if (gate) gate.classList.remove('open');
+}
+
+function showAuthGate(){
+  const gate = document.getElementById('auth-gate');
+  if (gate) gate.classList.add('open');
+}
+
+function hideAuthGate(){
+  const gate = document.getElementById('auth-gate');
+  if (gate) gate.classList.remove('open');
+}
+
+async function doSaveBackend(){
+  const urlEl = document.getElementById('backend-url-input');
+  const errEl = document.getElementById('backend-error');
+  const btn = document.getElementById('backend-save');
+  const url = urlEl.value.trim();
+
+  if (!url){
+    errEl.textContent = 'Ingresa la URL de tu backend.';
+    errEl.style.display = 'block';
+    return;
+  }
+  if (!/^https?:\/\//i.test(url)){
+    errEl.textContent = 'La URL debe empezar con http:// o https://';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  errEl.style.display = 'none';
+  btn.disabled = true;
+  btn.textContent = 'Guardando...';
+
+  state.apiUrl = url.replace(/\/$/, '');
+  localStorage.setItem('panel_api_url', state.apiUrl);
+
+  btn.disabled = false;
+  btn.textContent = 'Guardar y continuar';
+
+  hideBackendGate();
+  await proceedPastBackendGate();
+}
+
+async function proceedPastBackendGate(){
+  initConfigFields();
+  // Puede que ya exista una sesión válida (cookie viva de una visita
+  // anterior); si no, se pide login. Si el backend no responde, también
+  // se pide login y el usuario verá el error de conexión al intentar entrar.
+  const authenticated = await checkAuth();
+  if (authenticated){
+    unlockApp();
+    await bootPanel();
+  } else {
+    showAuthGate();
+  }
+}
+
+async function doLogin(){
+  const userEl = document.getElementById('auth-username');
+  const passEl = document.getElementById('auth-password');
+  const errEl = document.getElementById('auth-error');
+  const btn = document.getElementById('auth-submit');
+  const username = userEl.value.trim();
+  const password = passEl.value;
+
+  if (!apiUrlOk()){
+    // No debería poder llegar aquí sin backend configurado, pero por las
+    // dudas lo mandamos de vuelta al primer paso.
+    hideAuthGate();
+    showBackendGate();
+    return;
+  }
+  if (!username || !password){
+    errEl.textContent = 'Usuario y contraseña son obligatorios.';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  errEl.style.display = 'none';
+  btn.disabled = true;
+  btn.textContent = 'Entrando...';
+
+  try {
+    const base = state.apiUrl.replace(/\/$/, '');
+    const res = await fetch(base + '/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ username, password })
+    });
+    const data = await res.json();
+    if (res.ok && data.success){
+      setAuthToken(data.token || null);
+      passEl.value = '';
+      hideAuthGate();
+      unlockApp();
+      await bootPanel();
+    } else {
+      errEl.textContent = data.message || 'No se pudo iniciar sesión.';
+      errEl.style.display = 'block';
+    }
+  } catch (e) {
+    errEl.textContent = 'Error de conexión con el backend.';
+    errEl.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Entrar';
+  }
+}
+
+async function doLogout(){
+  lockApp();
+  if (apiUrlOk()){
+    try {
+      const base = state.apiUrl.replace(/\/$/, '');
+      await fetch(base + '/api/auth/logout', { method: 'POST', credentials: 'include', headers: authHeaders() });
+    } catch (e) { /* no pasa nada */ }
+  }
+  setAuthToken(null);
+  showAuthGate();
+}
+
+document.getElementById('backend-save')?.addEventListener('click', doSaveBackend);
+document.getElementById('backend-url-input')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') doSaveBackend();
+});
+document.getElementById('auth-submit')?.addEventListener('click', doLogin);
+document.getElementById('auth-password')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') doLogin();
+});
+document.getElementById('logout-btn')?.addEventListener('click', doLogout);
+
+/* --------- Login: panel avanzado (URL del backend + borrar datos) --------- */
+
+document.getElementById('auth-toggle-advanced')?.addEventListener('click', () => {
+  const panel = document.getElementById('auth-advanced-panel');
+  if (!panel) return;
+  const opening = panel.style.display === 'none';
+  panel.style.display = opening ? 'block' : 'none';
+  if (opening){
+    const urlEl = document.getElementById('auth-api-url');
+    if (urlEl) urlEl.value = state.apiUrl || '';
+  }
+});
+
+document.getElementById('auth-save-url')?.addEventListener('click', () => {
+  const urlEl = document.getElementById('auth-api-url');
+  const resultEl = document.getElementById('auth-advanced-result');
+  const url = urlEl.value.trim().replace(/\/$/, '');
+  if (!url || !/^https?:\/\//i.test(url)){
+    resultEl.textContent = 'Ingresa una URL válida (debe empezar con http:// o https://).';
+    resultEl.className = 'hint err';
+    return;
+  }
+  state.apiUrl = url;
+  localStorage.setItem('panel_api_url', url);
+  setAuthToken(null); // el backend puede ser otro: cualquier token viejo ya no sirve
+  resultEl.textContent = '✓ URL guardada. Intenta iniciar sesión de nuevo.';
+  resultEl.className = 'hint ok';
+});
+
+document.getElementById('auth-clear-storage')?.addEventListener('click', async () => {
+  const resultEl = document.getElementById('auth-advanced-result');
+  const confirmed = confirm('Esto va a borrar todos los datos guardados del panel en este navegador (sesión, URL del backend configurada, caché) y va a recargar la página. ¿Continuar?');
+  if (!confirmed) return;
+
+  try { localStorage.clear(); } catch (e) { /* no pasa nada */ }
+  try { sessionStorage.clear(); } catch (e) { /* no pasa nada */ }
+
+  try {
+    if ('caches' in window){
+      const keys = await caches.keys();
+      await Promise.all(keys.map(k => caches.delete(k)));
+    }
+  } catch (e) { /* no pasa nada */ }
+
+  try {
+    if ('serviceWorker' in navigator){
+      const registrations = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(registrations.map(r => r.unregister()));
+    }
+  } catch (e) { /* no pasa nada */ }
+
+  if (resultEl){
+    resultEl.textContent = 'Datos borrados. Recargando...';
+    resultEl.className = 'hint ok';
+  }
+  setTimeout(() => { window.location.reload(); }, 600);
+});
+
+/* --------------------------------- Init ---------------------------------- */
+
+async function bootPanel(){
+  initConfigFields();
+  if (apiUrlOk()){
+    const ok = await testConnection();
+    if (ok){
+      renderNotificationIconPicker();
+      loadProductos();
+      loadPedidosSection();
+      loadNotificationBanner();
+      loadResumen();
+    } else {
+      renderNotificationIconPicker();
+      goToView('config');
+    }
+  } else {
+    goToView('config');
+  }
+}
+
+(async function init(){
+  // Arranque siempre bloqueado. El panel (.app) ya nace oculto por CSS
+  // (clase "locked" en el HTML) — esto es solo el respaldo en JS.
+  lockApp();
+
+  if (!apiUrlOk()){
+    // Primer uso / navegador nuevo: todavía no hay backend guardado.
+    // Lo primero que se ve es el cartel para configurarlo, nada más.
+    showBackendGate();
+    return;
+  }
+
+  // Ya hay backend guardado de una visita anterior: saltamos directo
+  // a comprobar sesión / pedir login.
+  await proceedPastBackendGate();
+})();
+
+function parseFechaPedidoLocal(fechaStr){
+  if (!fechaStr) return null;
+  const valor = String(fechaStr).trim();
+  const partes = valor.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/);
+  const fecha = partes
+    ? new Date(Number(partes[1]), Number(partes[2]) - 1, Number(partes[3]), Number(partes[4] || 0), Number(partes[5] || 0), Number(partes[6] || 0))
+    : new Date(valor);
+  return Number.isNaN(fecha.getTime()) ? null : fecha;
+}
+
+function esDelMesActual(fechaStr){
+  const f = parseFechaPedidoLocal(fechaStr);
+  if (!f) return false;
+  const now = new Date();
+  return f.getFullYear() === now.getFullYear() && f.getMonth() === now.getMonth();
+}
+
+function fechaAyer(fechaStr){
+  const f = parseFechaPedidoLocal(fechaStr);
+  if (!f) return false;
+  const ayer = new Date();
+  ayer.setDate(ayer.getDate() - 1);
+  return f.getFullYear() === ayer.getFullYear() && f.getMonth() === ayer.getMonth() && f.getDate() === ayer.getDate();
+}
+
+function fechaHoy(fechaStr){
+  const f = parseFechaPedidoLocal(fechaStr);
+  if (!f) return false;
+  const hoy = new Date();
+  return f.getFullYear() === hoy.getFullYear() && f.getMonth() === hoy.getMonth() && f.getDate() === hoy.getDate();
+}
+
+function esDelMesAnterior(fechaStr){
+  const f = parseFechaPedidoLocal(fechaStr);
+  if (!f) return false;
+  const hoy = new Date();
+  const mesAnterior = new Date(hoy.getFullYear(), hoy.getMonth() - 1, 1);
+  return f.getFullYear() === mesAnterior.getFullYear() && f.getMonth() === mesAnterior.getMonth();
+}
+
+function calcularPronosticoMensual(ventasMes, ventasMesAnterior, fecha = new Date(), ventasUltimos7Dias = null){
+  const diasTranscurridos = fecha.getDate();
+  const diasDelMes = new Date(fecha.getFullYear(), fecha.getMonth() + 1, 0).getDate();
+  const diasMesAnterior = new Date(fecha.getFullYear(), fecha.getMonth(), 0).getDate();
+  const promedioDiarioMes = ventasMes / diasTranscurridos;
+  const promedioDiarioMesAnterior = ventasMesAnterior / diasMesAnterior;
+  const diasRestantes = diasDelMes - diasTranscurridos;
+  const promedioUltimos7Dias = ventasUltimos7Dias === null ? promedioDiarioMes : (Number(ventasUltimos7Dias) || 0) / 7;
+  const ritmos = [promedioDiarioMes, promedioDiarioMesAnterior, promedioUltimos7Dias].filter(Number.isFinite);
+  const promedioPonderado = promedioDiarioMes * 0.5 + promedioUltimos7Dias * 0.3 + promedioDiarioMesAnterior * 0.2;
+  const ventasAcumuladas = Number(ventasMes) || 0;
+  return {
+    diasTranscurridos,
+    diasDelMes,
+    diasMesAnterior,
+    diasRestantes,
+    promedioDiarioMes,
+    promedioDiarioMesAnterior,
+    promedioUltimos7Dias,
+    promedioPonderado,
+    pronosticoCierreMes: ventasAcumuladas + promedioPonderado * diasRestantes,
+    pronosticoMinimo: ventasAcumuladas + Math.min(...ritmos) * diasRestantes,
+    pronosticoMaximo: ventasAcumuladas + Math.max(...ritmos) * diasRestantes
+  };
+}
+
+function montoPedido(pedido){
+  const monto = Number(pedido && pedido.precio_compra_total);
+  return Number.isFinite(monto) && monto > 0 ? monto : 0;
+}
+
+function pedidoEstaPagado(pedido){
+  return toBoolean(pedido && pedido.pagado);
+}
+
+function calcularMetricasClientes(pedidos, fechaActual = new Date()){
+  const identificables = (pedidos || []).filter(pedido => {
+    return Boolean(String(pedido.telefono_comprador || '').replace(/\D/g, '')
+      || String(pedido.correo_comprador || '').trim().toLowerCase().replace('n/a', '')
+      || String(pedido.usuarioId || pedido.userId || pedido.id_usuario || '').trim());
+  });
+  const padre = identificables.map((_, index) => index);
+  const encontrar = index => {
+    while (padre[index] !== index){ padre[index] = padre[padre[index]]; index = padre[index]; }
+    return index;
+  };
+  const unir = (a, b) => { const raizA = encontrar(a), raizB = encontrar(b); if (raizA !== raizB) padre[raizB] = raizA; };
+  const identidadIndex = new Map();
+  identificables.forEach((pedido, index) => {
+    const identidades = [
+      { tipo: 'tel', valor: String(pedido.telefono_comprador || '').replace(/\D/g, '') },
+      { tipo: 'correo', valor: String(pedido.correo_comprador || '').trim().toLowerCase() },
+      { tipo: 'id', valor: String(pedido.usuarioId || pedido.userId || pedido.id_usuario || '').trim() }
+    ].filter(({ valor }) => valor && valor !== 'n/a');
+    identidades.forEach(({ tipo, valor }) => {
+      const clave = `${tipo}:${valor}`;
+      if (identidadIndex.has(clave)) unir(index, identidadIndex.get(clave));
+      else identidadIndex.set(clave, index);
+    });
+  });
+  const clientes = new Map();
+  identificables.forEach((pedido, index) => {
+    const raiz = encontrar(index);
+    const cliente = clientes.get(raiz) || { pedidos: 0, primeraFecha: null, ultimaFecha: null };
+    cliente.pedidos++;
+    const fecha = parseFechaPedidoLocal(getPedidoFecha(pedido));
+    if (fecha && (!cliente.primeraFecha || fecha < cliente.primeraFecha)) cliente.primeraFecha = fecha;
+    if (fecha && (!cliente.ultimaFecha || fecha > cliente.ultimaFecha)) cliente.ultimaFecha = fecha;
+    clientes.set(raiz, cliente);
+  });
+  const diasDesdeUltimaCompra = cliente => cliente.ultimaFecha
+    ? Math.floor((new Date(fechaActual.getFullYear(), fechaActual.getMonth(), fechaActual.getDate()) - new Date(cliente.ultimaFecha.getFullYear(), cliente.ultimaFecha.getMonth(), cliente.ultimaFecha.getDate())) / 86400000)
+    : null;
+  const list = Array.from(clientes.values());
+  return {
+    identificables: list.length,
+    recurrentes: list.filter(cliente => cliente.pedidos > 1).length,
+    nuevosEsteMes: list.filter(cliente => cliente.primeraFecha && cliente.primeraFecha.getFullYear() === fechaActual.getFullYear() && cliente.primeraFecha.getMonth() === fechaActual.getMonth()).length,
+    inactivosRecurrentes: list.filter(cliente => cliente.pedidos > 1 && diasDesdeUltimaCompra(cliente) >= 60).length
+  };
+}
+
+function sumaCompras(pedidos){
+  return pedidos.reduce((acc, p) => {
+    const compras = Array.isArray(p.compras) ? p.compras : [];
+    return acc + compras.reduce((a, c) => a + Number(c.quantity ?? c.cantidad ?? 1), 0);
+  }, 0);
+}
+
+function parseTimeToSeconds(timeStr){
+  if (!timeStr) return null;
+  const parts = timeStr.replace('.', ':').split(':').map(x => Number(x.trim()));
+  if (parts.length !== 2 || parts.some(n => Number.isNaN(n))) return null;
+  return parts[0] * 3600 + parts[1] * 60;
+}
+
+function parseDurationValue(val){
+  if (val == null) return 0;
+  if (typeof val === 'number' && !Number.isNaN(val)) return Number(val);
+  if (typeof val === 'string'){
+    const normalized = val.trim().replace(/\s+/g, ' ').toLowerCase();
+    const numeric = Number(normalized);
+    if (!Number.isNaN(numeric)) return numeric;
+
+    const rangeMatch = normalized.match(/(\d{1,2}[:.]\d{2})\s*(?:-|–|—|a|al|hasta)\s*(\d{1,2}[:.]\d{2})/);
+    if (rangeMatch){
+      const start = parseTimeToSeconds(rangeMatch[1]);
+      const end = parseTimeToSeconds(rangeMatch[2]);
+      if (start != null && end != null){
+        return end >= start ? end - start : (24 * 3600 - start + end);
+      }
+    }
+
+    const parts = normalized.split(':').map(x => Number(x.trim()));
+    if (parts.length === 3 && parts.every(n => !Number.isNaN(n))) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (parts.length === 2 && parts.every(n => !Number.isNaN(n))) return parts[0] * 60 + parts[1];
+  }
+  return 0;
+}
+
+function parseSessionDuration(u){
+  if (u == null) return 0;
+  if (typeof u === 'object' && u.duracion_sesion_segundos != null){
+    const val = Number(u.duracion_sesion_segundos);
+    if (!Number.isNaN(val) && val > 0) return val;
+  }
+  if (typeof u !== 'object') return parseDurationValue(u);
+  const candidato = u.horario_de_conexion ?? u.horario_conexion ?? u.horario ?? u.conexion_horario ?? u.duracion ?? u.duration ?? u.tiempo ?? u.tiempo_conexion ?? u.sessionDuration ?? u.session_length ?? u.duracion_sesion;
+  return parseDurationValue(candidato);
+}
+
+function horaDeEntrada(u){
+  const f = u && (u.fecha_hora_entrada || u.fecha_hora || u.fecha);
+  if (!f) return null;
+  const fecha = new Date(String(f).replace(' ', 'T'));
+  if (isNaN(fecha)) return null;
+  return fecha.getHours();
+}
+
+function formatDuration(seconds){
+  if (!seconds || seconds <= 0) return '—';
+  const horas = Math.floor(seconds / 3600);
+  const minutos = Math.round((seconds % 3600) / 60);
+  if (horas > 0) return `${horas}h ${minutos}m`;
+  return `${minutos}m`;
+}
+
+function renderVentasMesChart(pedidos, pronostico = null){
+  const dias = [];
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth();
+  const diasDelMes = new Date(year, month + 1, 0).getDate();
+  const diasMesAnterior = new Date(year, month, 0).getDate();
+  const fechaMesAnterior = new Date(year, month - 1, 1);
+  for (let d = 1; d <= diasDelMes; d++) {
+    dias.push({ dia: d, total: 0, anterior: 0 });
+  }
+  pedidos.forEach(p => {
+    const fecha = parseFechaPedidoLocal(getPedidoFecha(p));
+    if (!fecha) return;
+    const idx = fecha.getDate() - 1;
+    if (fecha.getFullYear() === year && fecha.getMonth() === month) dias[idx].total += montoPedido(p);
+    else if (fecha.getFullYear() === fechaMesAnterior.getFullYear() && fecha.getMonth() === fechaMesAnterior.getMonth() && idx < dias.length){
+      dias[idx].anterior += montoPedido(p);
+    }
+  });
+  const hayVentas = dias.some(d => d.total > 0);
+  const cards = dias.map(day => `
+    <div class="chart-card" title="Día ${day.dia}: $${day.total.toFixed(2)}">
+      <span class="chart-card-day">${day.dia}</span>
+      <span class="chart-card-value"${day.total > 0 ? '' : ' data-zero="true"'}>$${day.total.toFixed(2)}</span>
+    </div>`).join('');
+  const chart = document.getElementById('resu-ventas-mes-chart');
+  if (chart){
+    const diaCorte = now.getDate();
+    const acumuladoActual = dias.slice(0, diaCorte).map((_, i) => dias.slice(0, i + 1).reduce((total, dia) => total + dia.total, 0));
+    const acumuladoAnterior = dias.slice(0, Math.min(diaCorte, diasMesAnterior)).map((_, i) => dias.slice(0, i + 1).reduce((total, dia) => total + dia.anterior, 0));
+    const valorPronostico = pronostico?.pronosticoCierreMes ?? acumuladoActual.at(-1) ?? 0;
+    const maxValor = Math.max(...acumuladoActual, ...acumuladoAnterior, valorPronostico, 1);
+    const xForDay = day => 70 + ((day - 1) / Math.max(1, diasDelMes - 1)) * 880;
+    const yForValue = value => 190 - (value / maxValor) * 150;
+    const puntosActual = acumuladoActual.map((valor, i) => `${xForDay(i + 1)},${yForValue(valor)}`).join(' ');
+    const puntosAnterior = acumuladoAnterior.map((valor, i) => `${xForDay(i + 1)},${yForValue(valor)}`).join(' ');
+    const puntoCierre = `${xForDay(diaCorte)},${yForValue(acumuladoActual.at(-1) || 0)} ${xForDay(diasDelMes)},${yForValue(valorPronostico)}`;
+    const lineas = [0, 1, 2, 3].map(i => {
+      const valor = maxValor * i / 3;
+      const y = yForValue(valor);
+      return `<line x1="70" y1="${y}" x2="950" y2="${y}" class="sales-trend-gridline"/><text x="60" y="${y + 4}" text-anchor="end" class="sales-trend-axis">$${valor.toFixed(0)}</text>`;
+    }).join('');
+    const marcas = [1, 7, 14, 21, diasDelMes].filter((day, index, arr) => day <= diasDelMes && arr.indexOf(day) === index)
+      .map(day => `<text x="${xForDay(day)}" y="222" text-anchor="middle" class="sales-trend-axis">${day}</text>`).join('');
+    const tendencia = `<div class="sales-trend-wrap"><svg viewBox="0 0 1000 240" class="sales-trend-svg" role="img" aria-label="Ventas acumuladas de este mes comparadas con el mismo tramo del mes anterior">
+      ${lineas}${marcas}
+      <polyline points="${puntosAnterior}" class="sales-trend-line sales-trend-previous"/>
+      <polyline points="${puntosActual}" class="sales-trend-line sales-trend-current"/>
+      ${pronostico ? `<polyline points="${puntoCierre}" class="sales-trend-line sales-trend-forecast"/>` : ''}
+    </svg><div class="sales-trend-legend"><span><i class="sales-trend-key current"></i>Este mes</span><span><i class="sales-trend-key previous"></i>Mismo tramo anterior</span><span><i class="sales-trend-key forecast"></i>Pronóstico</span></div></div>`;
+    chart.innerHTML = `
+      <div class="chart-legend">
+        <span>Ventas acumuladas por día</span>
+        <strong>${hayVentas ? `${dias.filter(d => d.total > 0).length} días con ventas` : 'Sin ventas'}</strong>
+      </div>
+      ${hayVentas || acumuladoAnterior.some(total => total > 0) ? tendencia : `<div class="chart-empty">No hay ventas registradas para comparar.</div>`}
+      ${hayVentas ? `<div class="chart-grid-cards">${cards}</div>` : ''}`;
+  }
+}
+
+const nodeChartRenderers = new Map();
+let nodeChartResizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(nodeChartResizeTimer);
+  nodeChartResizeTimer = setTimeout(() => { nodeChartRenderers.forEach(fn => fn()); }, 200);
+});
+function registrarNodeChart(id, fn){
+  nodeChartRenderers.set(id, fn);
+  fn();
+}
+
+function truncarTexto(str, max){
+  const s = String(str || '');
+  return s.length > max ? s.slice(0, max - 1) + '…' : s;
+}
+
+function obtenerTooltipNodo(el){
+  let tooltip = el.querySelector('.node-tooltip');
+  if (!tooltip){
+    tooltip = document.createElement('div');
+    tooltip.className = 'node-tooltip';
+    el.appendChild(tooltip);
+  }
+  return tooltip;
+}
+
+function initNodeChartInteractivity(el){
+  const svg = el.querySelector('svg');
+  if (!svg) return;
+  const tooltip = obtenerTooltipNodo(el);
+  const nodos = Array.from(svg.querySelectorAll('.flow-node[data-node-id]'));
+  const enlaces = Array.from(svg.querySelectorAll('.flow-link[data-from]'));
+  const grupoEnlaces = svg.querySelector('.flow-links');
+
+  function limpiarEstado(){
+    svg.classList.remove('chart-hovering');
+    if (grupoEnlaces) grupoEnlaces.classList.remove('has-active');
+    nodos.forEach(n => n.classList.remove('is-active'));
+    enlaces.forEach(l => l.classList.remove('flow-link-active'));
+    tooltip.classList.remove('visible');
+  }
+
+  function activarNodo(nodeId){
+    svg.classList.add('chart-hovering');
+    if (grupoEnlaces) grupoEnlaces.classList.add('has-active');
+    nodos.forEach(n => n.classList.toggle('is-active', n.dataset.nodeId === nodeId));
+    enlaces.forEach(l => {
+      const activo = l.dataset.from === nodeId || l.dataset.to === nodeId;
+      l.classList.toggle('flow-link-active', activo);
+      if (activo){
+        const otroId = l.dataset.from === nodeId ? l.dataset.to : l.dataset.from;
+        const otroNodo = nodos.find(n => n.dataset.nodeId === otroId);
+        if (otroNodo) otroNodo.classList.add('is-active');
+      }
+    });
+  }
+
+  function ubicarTooltip(clientX, clientY){
+    const rect = el.getBoundingClientRect();
+    let x = clientX - rect.left + 16;
+    let y = clientY - rect.top - 14;
+    const tw = tooltip.offsetWidth || 140;
+    const th = tooltip.offsetHeight || 50;
+    if (x + tw > rect.width) x = clientX - rect.left - tw - 16;
+    if (y < 4) y = clientY - rect.top + 20;
+    if (y + th > rect.height) y = Math.max(4, rect.height - th - 6);
+    tooltip.style.left = `${Math.max(4, x)}px`;
+    tooltip.style.top = `${Math.max(4, y)}px`;
+  }
+
+  function mostrarTooltip(node, clientX, clientY){
+    const titulo = node.dataset.ttTitle || '';
+    const valor = node.dataset.ttValue || '';
+    const extra = node.dataset.ttExtra || '';
+    tooltip.innerHTML = `<div class="node-tooltip-title">${escapeHtml(titulo)}</div><div class="node-tooltip-value">${escapeHtml(valor)}</div>${extra ? `<div class="node-tooltip-extra">${escapeHtml(extra)}</div>` : ''}`;
+    tooltip.classList.add('visible');
+    ubicarTooltip(clientX, clientY);
+  }
+
+  nodos.forEach(node => {
+    const hit = node.querySelector('.flow-node-hit') || node;
+    hit.addEventListener('mouseenter', (e) => { activarNodo(node.dataset.nodeId); mostrarTooltip(node, e.clientX, e.clientY); });
+    hit.addEventListener('mousemove', (e) => { ubicarTooltip(e.clientX, e.clientY); });
+    hit.addEventListener('mouseleave', limpiarEstado);
+    hit.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      const t = e.touches[0];
+      activarNodo(node.dataset.nodeId);
+      mostrarTooltip(node, t.clientX, t.clientY);
+    }, { passive: false });
+  });
+
+  el.addEventListener('touchend', () => { setTimeout(limpiarEstado, 1400); }, { passive: true });
+}
+
+function nodoSvg(clase, id, x, y, r, rHit, ttTitle, ttValor, ttExtra, contenidoHtml, delay){
+  return `
+    <g class="flow-node ${clase}" data-node-id="${id}" data-tt-title="${escapeHtml(ttTitle)}" data-tt-value="${escapeHtml(ttValor)}" data-tt-extra="${escapeHtml(ttExtra || '')}" style="animation-delay:${delay.toFixed(2)}s">
+      ${contenidoHtml}
+      <circle class="flow-node-hit" cx="${x}" cy="${y}" r="${rHit}"></circle>
+    </g>`;
+}
+function curvaHorizontal(a, b){
+  const mx = Math.round((a.x + b.x) / 2);
+  return `M ${a.x} ${a.y} C ${mx} ${a.y}, ${mx} ${b.y}, ${b.x} ${b.y}`;
+}
+function curvaVertical(a, b){
+  const my = Math.round((a.y + b.y) / 2);
+  return `M ${a.x} ${a.y} C ${a.x} ${my}, ${b.x} ${my}, ${b.x} ${b.y}`;
+}
+
+function renderFlowChart(origenesOrdenadosFull, totalVisitas, totalPedidos, ventasTotal){
+  const el = document.getElementById('resu-flow-chart');
+  if (!el) return;
+
+  const top = origenesOrdenadosFull.slice(0, 5);
+  const restoCount = origenesOrdenadosFull.slice(5).reduce((acc, [, v]) => acc + v, 0);
+  const origenes = restoCount > 0 ? [...top, ['Otros', restoCount]] : top;
+
+  if (!origenes.length || !totalVisitas){
+    el.innerHTML = `<div class="chart-empty">Todavía no hay datos suficientes para mostrar el flujo.</div>`;
+    return;
+  }
+
+  const contW = Math.round(el.clientWidth || el.getBoundingClientRect().width || (window.innerWidth - 60));
+  const compacto = contW < 640;
+  // Calcula longitud máxima de etiqueta según ancho y cantidad de orígenes.
+  const labelMaxLen = compacto ? 8 : (contW < 900 ? 12 : 16);
+  const showOriginLabels = !compacto || origenes.length <= 5;
+  const maxOrigen = Math.max(...origenes.map(([, v]) => v));
+  const nodoVisitas = { label: 'Visitas', valor: String(totalVisitas) };
+  const nodoPedidos = { label: 'Pedidos', valor: String(totalPedidos) };
+  const nodoFinal = { label: 'Ventas', valor: `$${ventasTotal.toFixed(2)}` };
+
+  el.innerHTML = compacto
+    ? flowChartVertical(origenes, maxOrigen, nodoVisitas, nodoPedidos, nodoFinal, contW, labelMaxLen, showOriginLabels)
+    : flowChartHorizontal(origenes, maxOrigen, nodoVisitas, nodoPedidos, nodoFinal, contW, labelMaxLen, showOriginLabels);
+  initNodeChartInteractivity(el);
+}
+
+function flowChartHorizontal(origenes, maxOrigen, nodoVisitas, nodoPedidos, nodoFinal, contW, labelMaxLen = 16, showOriginLabels = true){
+  const width = Math.max(640, contW);
+  const height = Math.max(230, origenes.length * 46 + 60);
+  const xOrigen = 14;
+  const xVisitas = Math.round(width * 0.4);
+  const xPedidos = Math.round(width * 0.68);
+  const xFinal = width - 90;
+  const cy = height / 2;
+  const step = height / (origenes.length + 1);
+
+  const totalVisitas = Number(nodoVisitas.valor) || 0;
+  const totalPedidos = Number(nodoPedidos.valor) || 0;
+  const ventasNum = Number(String(nodoFinal.valor).replace(/[^0-9.-]/g, '')) || 0;
+  const conversion = totalVisitas ? ((totalPedidos / totalVisitas) * 100).toFixed(1) : '0';
+  const ticket = totalPedidos ? (ventasNum / totalPedidos).toFixed(2) : '0.00';
+
+  const nodosOrigen = origenes.map(([nombre, valor], i) => ({
+    nombre: truncarTexto(nombre, labelMaxLen), valor, x: xOrigen, y: Math.round(step * (i + 1)),
+    r: Math.round(5 + (valor / maxOrigen) * 9)
+  }));
+  const vis = { x: xVisitas, y: cy, r: 24, ...nodoVisitas };
+  const ped = { x: xPedidos, y: cy, r: 24, ...nodoPedidos };
+  const fin = { x: xFinal, y: cy, r: 26, ...nodoFinal };
+
+  const linksOrigen = nodosOrigen.map((n, i) => {
+    const grosor = (1.4 + (n.valor / maxOrigen) * 3.6).toFixed(1);
+    return `<path class="flow-link" data-from="o${i}" data-to="vis" d="${curvaHorizontal(n, vis)}" stroke-width="${grosor}" style="animation-delay:${(i * 0.12).toFixed(2)}s"></path>`;
+  }).join('');
+  const linkVisPed = `<path class="flow-link flow-link-main" data-from="vis" data-to="ped" d="${curvaHorizontal(vis, ped)}" stroke-width="5"></path>`;
+  const linkPedFin = `<path class="flow-link flow-link-main" data-from="ped" data-to="fin" d="${curvaHorizontal(ped, fin)}" stroke-width="5"></path>`;
+
+  const origenNodosHtml = nodosOrigen.map((n, i) => {
+    const pct = totalVisitas ? ((n.valor / totalVisitas) * 100).toFixed(1) : '0';
+    const labelText = showOriginLabels ? `<text x="${n.x + n.r + 9}" y="${n.y - 4}" class="flow-node-label" text-anchor="start">${escapeHtml(n.nombre)}</text>` : '';
+    const contenido = `
+      <circle cx="${n.x}" cy="${n.y}" r="${n.r}"></circle>
+      ${labelText}
+      <text x="${n.x + n.r + 9}" y="${n.y + 13}" class="flow-node-value" text-anchor="start">${n.valor} visita${n.valor === 1 ? '' : 's'}</text>`;
+    return nodoSvg('flow-node-origin', `o${i}`, n.x, n.y, n.r, Math.max(n.r + 16, 28), n.nombre, `${n.valor} visita${n.valor === 1 ? '' : 's'}`, `${pct}% del total`, contenido, i * 0.08);
+  }).join('');
+
+  const central = (n, clase, id, extra, delay) => {
+    const contenido = `
+      <circle cx="${n.x}" cy="${n.y}" r="${n.r}"></circle>
+      <text x="${n.x}" y="${n.y - n.r - 10}" class="flow-node-label" text-anchor="middle">${escapeHtml(n.label)}</text>
+      <text x="${n.x}" y="${n.y + 5}" class="flow-node-value" text-anchor="middle">${escapeHtml(n.valor)}</text>`;
+    return nodoSvg(clase, id, n.x, n.y, n.r, n.r + 16, n.label, n.valor, extra, contenido, delay);
+  };
+
+  return `
+    <svg viewBox="0 0 ${width} ${height}" class="flow-svg" preserveAspectRatio="xMidYMid meet">
+      <g class="flow-links">${linksOrigen}${linkVisPed}${linkPedFin}</g>
+      ${origenNodosHtml}
+      ${central(vis, 'flow-node-mid', 'vis', 'Total de tráfico registrado', nodosOrigen.length * 0.08)}
+      ${central(ped, 'flow-node-mid', 'ped', `${conversion}% de conversión`, nodosOrigen.length * 0.08 + 0.1)}
+      ${central(fin, 'flow-node-final', 'fin', `Ticket promedio $${ticket}`, nodosOrigen.length * 0.08 + 0.2)}
+    </svg>`;
+}
+
+function flowChartVertical(origenes, maxOrigen, nodoVisitas, nodoPedidos, nodoFinal, contW, labelMaxLen = 10, showOriginLabels = true){
+  const width = Math.max(260, contW);
+  const cx = Math.round(width / 2);
+  const origenRowY = 34;
+  const stepOrigen = width / (origenes.length + 1);
+  const yVisitas = 130, yPedidos = 220, yFinal = 312;
+  const height = yFinal + 46;
+
+  const totalVisitas = Number(nodoVisitas.valor) || 0;
+  const totalPedidos = Number(nodoPedidos.valor) || 0;
+  const ventasNum = Number(String(nodoFinal.valor).replace(/[^0-9.-]/g, '')) || 0;
+  const conversion = totalVisitas ? ((totalPedidos / totalVisitas) * 100).toFixed(1) : '0';
+  const ticket = totalPedidos ? (ventasNum / totalPedidos).toFixed(2) : '0.00';
+
+  const nodosOrigen = origenes.map(([nombre, valor], i) => ({
+    nombre: truncarTexto(nombre, Math.max(6, Math.floor(labelMaxLen * 0.7))), valor, y: origenRowY, x: Math.round(stepOrigen * (i + 1)),
+    r: Math.round(5 + (valor / maxOrigen) * 8)
+  }));
+  const vis = { x: cx, y: yVisitas, r: 26, ...nodoVisitas };
+  const ped = { x: cx, y: yPedidos, r: 26, ...nodoPedidos };
+  const fin = { x: cx, y: yFinal, r: 28, ...nodoFinal };
+
+  const linksOrigen = nodosOrigen.map((n, i) => {
+    const grosor = (1.4 + (n.valor / maxOrigen) * 3.2).toFixed(1);
+    return `<path class="flow-link" data-from="o${i}" data-to="vis" d="${curvaVertical(n, vis)}" stroke-width="${grosor}" style="animation-delay:${(i * 0.12).toFixed(2)}s"></path>`;
+  }).join('');
+  const linkVisPed = `<path class="flow-link flow-link-main" data-from="vis" data-to="ped" d="${curvaVertical(vis, ped)}" stroke-width="5"></path>`;
+  const linkPedFin = `<path class="flow-link flow-link-main" data-from="ped" data-to="fin" d="${curvaVertical(ped, fin)}" stroke-width="5"></path>`;
+
+  const origenNodosHtml = nodosOrigen.map((n, i) => {
+    const pct = totalVisitas ? ((n.valor / totalVisitas) * 100).toFixed(1) : '0';
+    const labelText = showOriginLabels ? `<text x="${n.x}" y="${n.y - n.r - 7}" class="flow-node-label" text-anchor="middle">${escapeHtml(n.nombre)}</text>` : '';
+    const contenido = `
+      <circle cx="${n.x}" cy="${n.y}" r="${n.r}"></circle>
+      ${labelText}
+      <text x="${n.x}" y="${n.y + n.r + 15}" class="flow-node-value" text-anchor="middle">${n.valor}</text>`;
+    return nodoSvg('flow-node-origin', `o${i}`, n.x, n.y, n.r, Math.max(n.r + 14, 26), n.nombre, `${n.valor} visita${n.valor === 1 ? '' : 's'}`, `${pct}% del total`, contenido, i * 0.08);
+  }).join('');
+
+  const central = (n, clase, id, extra, delay) => {
+    const contenido = `
+      <circle cx="${n.x}" cy="${n.y}" r="${n.r}"></circle>
+      <text x="${n.x + n.r + 12}" y="${n.y - 4}" class="flow-node-label" text-anchor="start">${escapeHtml(n.label)}</text>
+      <text x="${n.x + n.r + 12}" y="${n.y + 14}" class="flow-node-value" text-anchor="start">${escapeHtml(n.valor)}</text>`;
+    return nodoSvg(clase, id, n.x, n.y, n.r, n.r + 16, n.label, n.valor, extra, contenido, delay);
+  };
+
+  return `
+    <svg viewBox="0 0 ${width} ${height}" class="flow-svg flow-svg-vertical" preserveAspectRatio="xMidYMid meet">
+      <g class="flow-links">${linksOrigen}${linkVisPed}${linkPedFin}</g>
+      ${origenNodosHtml}
+      ${central(vis, 'flow-node-mid', 'vis', 'Total de tráfico registrado', nodosOrigen.length * 0.08)}
+      ${central(ped, 'flow-node-mid', 'ped', `${conversion}% de conversión`, nodosOrigen.length * 0.08 + 0.1)}
+      ${central(fin, 'flow-node-final', 'fin', `Ticket promedio $${ticket}`, nodosOrigen.length * 0.08 + 0.2)}
+    </svg>`;
+}
+
+function renderNodeChainChart(containerId, nodos, opciones = {}){
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  const datos = nodos.filter(n => n && Number.isFinite(Number(n.value)));
+  if (!datos.length){
+    el.innerHTML = `<div class="chart-empty">${opciones.emptyText || 'Sin datos suficientes.'}</div>`;
+    return;
+  }
+  const contW = Math.round(el.clientWidth || el.getBoundingClientRect().width || (window.innerWidth - 60));
+  const compacto = contW < 480;
+  const max = Math.max(...datos.map(n => Number(n.value) || 0), 1);
+  el.innerHTML = compacto ? nodeChainVertical(datos, max, contW) : nodeChainHorizontal(datos, max, contW);
+  initNodeChartInteractivity(el);
+}
+
+function nodeChainHorizontal(datos, max, contW){
+  const width = Math.max(420, contW);
+  const height = 150;
+  const cy = Math.round(height / 2 + 6);
+  const margin = 70;
+  const stepX = datos.length > 1 ? (width - margin * 2) / (datos.length - 1) : 0;
+  const total = datos.reduce((acc, n) => acc + (Number(n.value) || 0), 0);
+  const nodos = datos.map((n, i) => ({
+    ...n, x: Math.round(margin + stepX * i), y: cy,
+    r: Math.round(20 + (Number(n.value) / max) * 15)
+  }));
+  const links = nodos.slice(0, -1).map((n, i) => {
+    const b = nodos[i + 1];
+    const grosor = (2 + (Math.min(n.value, b.value) / max) * 3.6).toFixed(1);
+    return `<path class="flow-link flow-link-chain" data-from="c${i}" data-to="c${i + 1}" d="${curvaHorizontal(n, b)}" stroke="${n.color || 'var(--teal)'}" stroke-width="${grosor}" style="animation-delay:${(i * 0.15).toFixed(2)}s"></path>`;
+  }).join('');
+  const nodosHtml = nodos.map((n, i) => {
+    const pct = total ? (((Number(n.value) || 0) / total) * 100).toFixed(1) : '0';
+    const contenido = `
+      <circle cx="${n.x}" cy="${n.y}" r="${n.r}" style="fill:${n.bg || 'rgba(91,141,239,.16)'}; stroke:${n.color || 'var(--blue)'};"></circle>
+      <text x="${n.x}" y="${n.y - n.r - 10}" class="flow-node-label" text-anchor="middle">${escapeHtml(n.label)}</text>
+      <text x="${n.x}" y="${n.y + 5}" class="flow-node-value" text-anchor="middle">${escapeHtml(n.display ?? String(n.value))}</text>`;
+    return nodoSvg('flow-node-chain', `c${i}`, n.x, n.y, n.r, n.r + 16, n.label, n.display ?? String(n.value), `${pct}% del total`, contenido, i * 0.1);
+  }).join('');
+  return `<svg viewBox="0 0 ${width} ${height}" class="flow-svg" preserveAspectRatio="xMidYMid meet"><g class="flow-links">${links}</g>${nodosHtml}</svg>`;
+}
+
+function nodeChainVertical(datos, max, contW){
+  const width = Math.max(220, contW);
+  const cx = Math.round(width / 2);
+  const stepY = 92;
+  const height = stepY * (datos.length - 1) + 100;
+  const total = datos.reduce((acc, n) => acc + (Number(n.value) || 0), 0);
+  const nodos = datos.map((n, i) => ({
+    ...n, x: cx, y: Math.round(56 + stepY * i),
+    r: Math.round(22 + (Number(n.value) / max) * 13)
+  }));
+  const links = nodos.slice(0, -1).map((n, i) => {
+    const b = nodos[i + 1];
+    const grosor = (2 + (Math.min(n.value, b.value) / max) * 3.6).toFixed(1);
+    return `<path class="flow-link flow-link-chain" data-from="c${i}" data-to="c${i + 1}" d="${curvaVertical(n, b)}" stroke="${n.color || 'var(--teal)'}" stroke-width="${grosor}" style="animation-delay:${(i * 0.15).toFixed(2)}s"></path>`;
+  }).join('');
+  const nodosHtml = nodos.map((n, i) => {
+    const pct = total ? (((Number(n.value) || 0) / total) * 100).toFixed(1) : '0';
+    const contenido = `
+      <circle cx="${n.x}" cy="${n.y}" r="${n.r}" style="fill:${n.bg || 'rgba(91,141,239,.16)'}; stroke:${n.color || 'var(--blue)'};"></circle>
+      <text x="${n.x + n.r + 12}" y="${n.y - 3}" class="flow-node-label" text-anchor="start">${escapeHtml(n.label)}</text>
+      <text x="${n.x + n.r + 12}" y="${n.y + 15}" class="flow-node-value" text-anchor="start">${escapeHtml(n.display ?? String(n.value))}</text>`;
+    return nodoSvg('flow-node-chain', `c${i}`, n.x, n.y, n.r, n.r + 14, n.label, n.display ?? String(n.value), `${pct}% del total`, contenido, i * 0.1);
+  }).join('');
+  return `<svg viewBox="0 0 ${width} ${height}" class="flow-svg flow-svg-vertical" preserveAspectRatio="xMidYMid meet"><g class="flow-links">${links}</g>${nodosHtml}</svg>`;
+}
+
+function renderHorasConexionChart(visitas){
+  const horas = Array.from({ length: 24 }, (_, h) => ({ hora: h, total: 0 }));
+  if (visitas && Array.isArray(visitas.byHour)){
+    // Preferimos el agregado del backend: no hace falta bajar todo el
+    // histórico de visitas para pintar este gráfico.
+    visitas.byHour.forEach((total, h) => {
+      if (h >= 0 && h < 24) horas[h].total = Number(total) || 0;
+    });
+  } else if (Array.isArray(visitas)){
+    for (let i = 0; i < visitas.length; i++) {
+      const h = horaDeEntrada(visitas[i]);
+      if (h != null) horas[h].total++;
+    }
+  }
+  const hayDatos = horas.some(h => h.total > 0);
+  const mejorHora = hayDatos ? horas.reduce((a, b) => (b.total > a.total ? b : a)) : null;
+  const max = hayDatos ? Math.max(...horas.map(h => h.total)) : 1;
+  const cards = horas.map(h => {
+    const width = hayDatos ? Math.max(10, Math.round((h.total / max) * 100)) : 10;
+    return `
+      <div class="hour-card" title="${h.hora}:00 — ${h.total} visita(s)">
+        <div class="hour-card-top">
+          <span class="hour-card-hour">${h.hora}:00</span>
+          <span class="hour-card-count">${h.total}</span>
+        </div>
+        <div class="hour-card-bar" style="width:${width}%"></div>
+      </div>`;
+  }).join('');
+  const chart = document.getElementById('resu-horas-chart');
+  if (!chart) return;
+  chart.innerHTML = `
+    <div class="chart-legend">
+      <span>Visitas por hora del día (hora de Cuba)</span>
+      <strong>${mejorHora ? `Pico: ${mejorHora.hora}:00 h` : '—'}</strong>
+    </div>
+    ${hayDatos ? `<div class="hour-grid">${cards}</div>` : `<div class="chart-empty">Todavía no hay registros suficientes para calcular horas pico.</div>`}`;
+}
+
+function calcularRangoFechas(){
+  const { preset, desde, hasta } = state.resumenRango;
+  const hoy = new Date();
+  const inicioDia = (d) => { const x = new Date(d); x.setHours(0,0,0,0); return x; };
+  const finDia = (d) => { const x = new Date(d); x.setHours(23,59,59,999); return x; };
+
+  if (preset === 'custom' && desde && hasta){
+    return { desde: inicioDia(new Date(desde)), hasta: finDia(new Date(hasta)), etiqueta: `${desde} a ${hasta}` };
+  }
+  if (preset === 'ayer'){
+    const ayer = new Date(hoy); ayer.setDate(ayer.getDate() - 1);
+    return { desde: inicioDia(ayer), hasta: finDia(ayer), etiqueta: 'Ayer' };
+  }
+  if (preset === '7dias'){
+    const inicio = new Date(hoy); inicio.setDate(inicio.getDate() - 6);
+    return { desde: inicioDia(inicio), hasta: finDia(hoy), etiqueta: 'Últimos 7 días' };
+  }
+  if (preset === '30dias'){
+    const inicio = new Date(hoy); inicio.setDate(inicio.getDate() - 29);
+    return { desde: inicioDia(inicio), hasta: finDia(hoy), etiqueta: 'Últimos 30 días' };
+  }
+  if (preset === 'mes'){
+    const inicio = new Date(hoy.getFullYear(), hoy.getMonth(), 1);
+    return { desde: inicioDia(inicio), hasta: finDia(hoy), etiqueta: 'Este mes' };
+  }
+  if (preset === 'mesanterior'){
+    const inicio = new Date(hoy.getFullYear(), hoy.getMonth() - 1, 1);
+    const fin = new Date(hoy.getFullYear(), hoy.getMonth(), 0);
+    return { desde: inicioDia(inicio), hasta: finDia(fin), etiqueta: 'Mes anterior' };
+  }
+  // 'hoy' por defecto
+  return { desde: inicioDia(hoy), hasta: finDia(hoy), etiqueta: 'Hoy' };
+}
+
+function renderRangoChart(pedidosEnRango, desde, hasta){
+  const dias = [];
+  const cursor = new Date(desde);
+  cursor.setHours(0,0,0,0);
+  const fin = new Date(hasta);
+  fin.setHours(0,0,0,0);
+  while (cursor <= fin && dias.length < 62){
+    dias.push({ fecha: new Date(cursor), total: 0 });
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  pedidosEnRango.forEach(p => {
+    const fecha = parseFechaPedidoLocal(getPedidoFecha(p));
+    if (!fecha) return;
+    const dia = dias.find(d => d.fecha.getFullYear() === fecha.getFullYear() && d.fecha.getMonth() === fecha.getMonth() && d.fecha.getDate() === fecha.getDate());
+    if (dia) dia.total += Number(p.precio_compra_total || 0);
+  });
+  const hayVentas = dias.some(d => d.total > 0);
+  const cards = dias.map(day => {
+    const label = `${day.fecha.getDate()}/${day.fecha.getMonth() + 1}`;
+    return `
+      <div class="chart-card" title="${label}: $${day.total.toFixed(2)}">
+        <span class="chart-card-day">${label}</span>
+        <span class="chart-card-value"${day.total > 0 ? '' : ' data-zero="true"'}>$${day.total.toFixed(2)}</span>
+      </div>`;
+  }).join('');
+  const chart = document.getElementById('resu-rango-chart');
+  if (!chart) return;
+  chart.innerHTML = dias.length ? `
+    <div class="chart-legend">
+      <span>Ventas por día</span>
+      <strong>${hayVentas ? 'Detalle del rango' : 'Sin ventas'}</strong>
+    </div>
+    ${hayVentas ? `<div class="chart-grid-cards">${cards}</div>` : `<div class="chart-empty">No hay ventas registradas en este rango.</div>`}`
+    : `<div class="chart-empty">Selecciona un rango válido.</div>`;
+}
+
+function renderResumenInsights({ pendienteCobro, pendientesCount, cambio7Dias, productosBajoStock, clientesInactivos }){
+  const contenedor = document.getElementById('resu-insights');
+  if (!contenedor) return;
+  const alertas = [];
+  if (pendienteCobro > 0){
+    alertas.push({ tipo: 'warn', titulo: 'Cobros pendientes', detalle: `${pendientesCount} pedido(s) por $${pendienteCobro.toFixed(2)} todavía no tienen pago confirmado.`, vista: 'pedidos' });
+  }
+  if (cambio7Dias !== null && cambio7Dias < -10){
+    alertas.push({ tipo: 'warn', titulo: 'Ritmo de pedidos en descenso', detalle: `Los últimos 7 días están ${Math.abs(cambio7Dias).toFixed(1)}% por debajo de los 7 días previos.`, vista: 'pedidos' });
+  }
+  if (productosBajoStock > 0){
+    alertas.push({ tipo: 'danger', titulo: 'Revisar existencias', detalle: `${productosBajoStock} producto(s) controlado(s) están bajo el umbral o agotados.`, vista: 'inventario' });
+  }
+  if (clientesInactivos > 0){
+    alertas.push({ tipo: 'info', titulo: 'Clientes recurrentes inactivos', detalle: `${clientesInactivos} cliente(s) recurrente(s) llevan al menos 60 días sin comprar.`, vista: 'usuarios' });
+  }
+  contenedor.innerHTML = alertas.length ? alertas.map(alerta => `
+    <div class="mini-row resu-insight-row">
+      <span class="k"><span class="pill pill-${alerta.tipo}">${escapeHtml(alerta.titulo)}</span> ${escapeHtml(alerta.detalle)}</span>
+      <button class="btn btn-ghost btn-small" type="button" data-resu-goto="${alerta.vista}">Abrir</button>
+    </div>`).join('') : `<p class="hint">No hay alertas con los datos actuales.</p>`;
+}
+
+let ultimoResumenInforme = null;
+
+async function loadResumen(force = false){
+  try{
+    const [panelData, resumenVisitas, productosData] = await Promise.all([
+      apiFetch('/api/panel/pedidos?compact=1', { force }),
+      // Resumen agregado: 4 tarjetas, gráficos y series sin descargar todo el
+      // histórico de visitas. El histórico completo solo se pide en "Usuarios".
+      apiFetch('/api/stats/summary', { force }).catch(() => null),
+      apiFetch('/api/products', { force }).catch(() => ({ products: [] }))
+    ]);
+    const nuevos = panelData.pedidos || [];
+    const asignados = panelData.pedidosAsignados || [];
+    const visitas = (resumenVisitas && resumenVisitas.success !== false) ? resumenVisitas : {};
+    const totalUsuarios = Number(visitas.total) || 0;
+    if (Array.isArray(productosData.products)) state.productos = productosData.products;
+    const asignadosIds = new Set(asignados.map(p => getOriginalPedidoId(p)));
+    const nuevosSinAsignar = nuevos.filter(p => !asignadosIds.has(getOriginalPedidoId(p)));
+
+    const pedidosUnicosMap = new Map();
+    [...nuevosSinAsignar, ...asignados].forEach(p => {
+      const id = getOriginalPedidoId(p) || `tmp-${Math.random()}`;
+      if (!pedidosUnicosMap.has(id) || p.fecha_asignacion) {
+        pedidosUnicosMap.set(id, p);
+      }
+    });
+    const pedidosUnicos = Array.from(pedidosUnicosMap.values());
+
+    const delMes = pedidosUnicos.filter(p => esDelMesActual(getPedidoFecha(p)));
+    const ventasMes = delMes.reduce((acc, p) => acc + montoPedido(p), 0);
+    const ingresosCobradosMes = delMes.filter(pedidoEstaPagado).reduce((acc, p) => acc + montoPedido(p), 0);
+    const pendienteCobroMes = Math.max(0, ventasMes - ingresosCobradosMes);
+    const ventasHoy = pedidosUnicos.filter(p => fechaHoy(getPedidoFecha(p))).reduce((acc, p) => acc + Number(p.precio_compra_total || 0), 0);
+    const ventasAyer = pedidosUnicos.filter(p => fechaAyer(getPedidoFecha(p))).reduce((acc, p) => acc + Number(p.precio_compra_total || 0), 0);
+    const ventasMesAnterior = pedidosUnicos.filter(p => esDelMesAnterior(getPedidoFecha(p))).reduce((acc, p) => acc + Number(p.precio_compra_total || 0), 0);
+    const hoy = new Date();
+    const inicioUltimos7Dias = new Date(hoy.getFullYear(), hoy.getMonth(), hoy.getDate() - 6);
+    const inicio7DiasPrevios = new Date(hoy.getFullYear(), hoy.getMonth(), hoy.getDate() - 13);
+    const fin7DiasPrevios = new Date(hoy.getFullYear(), hoy.getMonth(), hoy.getDate() - 7, 23, 59, 59, 999);
+    const ventasUltimos7Dias = pedidosUnicos.reduce((acc, p) => {
+      const fecha = parseFechaPedidoLocal(getPedidoFecha(p));
+      return fecha && fecha >= inicioUltimos7Dias && fecha <= hoy ? acc + montoPedido(p) : acc;
+    }, 0);
+    const ventas7DiasPrevios = pedidosUnicos.reduce((acc, p) => {
+      const fecha = parseFechaPedidoLocal(getPedidoFecha(p));
+      return fecha && fecha >= inicio7DiasPrevios && fecha <= fin7DiasPrevios ? acc + montoPedido(p) : acc;
+    }, 0);
+    const mesAnterior = new Date(hoy.getFullYear(), hoy.getMonth() - 1, 1);
+    const mesAnteriorMismoDia = new Date(hoy.getFullYear(), hoy.getMonth(), 0).getDate();
+    const diaCorteComparacion = Math.min(hoy.getDate(), mesAnteriorMismoDia);
+    const ventasMesAnteriorMismoDia = pedidosUnicos.reduce((acc, p) => {
+      const fecha = parseFechaPedidoLocal(getPedidoFecha(p));
+      return fecha && fecha.getFullYear() === mesAnterior.getFullYear()
+        && fecha.getMonth() === mesAnterior.getMonth()
+        && fecha.getDate() <= diaCorteComparacion ? acc + montoPedido(p) : acc;
+    }, 0);
+    const pronostico = calcularPronosticoMensual(ventasMes, ventasMesAnterior, hoy, ventasUltimos7Dias);
+    const metricasClientes = calcularMetricasClientes(pedidosUnicos, hoy);
+    const productosVendidosMes = sumaCompras(delMes);
+    const recurrentes = Number(visitas.recurrentes) || 0;
+    const seguimientoAbierto = asignados.filter(p => estadoPedidoKey(p) !== 'completado').length;
+    const promedioSegundos = Number(visitas.avgSessionSeconds) || 0;
+    const seguimientoNoPagado = asignados.filter(p => !toBoolean(p.pagado)).length;
+    const crecimientoPorcentaje = ventasMesAnterior > 0
+      ? ((ventasMes - ventasMesAnterior) / ventasMesAnterior) * 100
+      : (ventasMes > 0 ? null : 0);
+    const crecimientoTexto = crecimientoPorcentaje === null
+      ? 'Nuevo mes'
+      : crecimientoPorcentaje === 0
+        ? '0%'
+        : `${crecimientoPorcentaje > 0 ? '▲ +' : '▼ '}${Math.abs(crecimientoPorcentaje).toFixed(1)}%`;
+    const crecimientoClase = crecimientoPorcentaje > 0
+      ? 'growth-positive'
+      : crecimientoPorcentaje < 0
+        ? 'growth-negative'
+        : 'growth-neutral';
+
+    setText('resu-ventas-mes', '$' + ventasMes.toFixed(2));
+    setText('resu-ingresos-cobrados', '$' + ingresosCobradosMes.toFixed(2));
+    setText('resu-pendiente-cobro', '$' + pendienteCobroMes.toFixed(2));
+    setText('resu-pendiente-cobro-sub', `${delMes.filter(p => !pedidoEstaPagado(p)).length} pedido(s) aún sin pago confirmado`);
+    setText('resu-promedio-diario', '$' + pronostico.promedioDiarioMes.toFixed(2));
+    setText('resu-promedio-diario-sub', `${ventasMes.toFixed(2)} ÷ ${pronostico.diasTranscurridos} días transcurridos`);
+    setText('resu-promedio-anterior', '$' + pronostico.promedioDiarioMesAnterior.toFixed(2));
+    setText('resu-promedio-anterior-sub', `${ventasMesAnterior.toFixed(2)} ÷ ${pronostico.diasMesAnterior} días del mes anterior`);
+    setText('resu-pronostico-mes', '$' + pronostico.pronosticoCierreMes.toFixed(2));
+    setText('resu-pronostico-mes-sub', `Escenario central · rango $${pronostico.pronosticoMinimo.toFixed(2)}–$${pronostico.pronosticoMaximo.toFixed(2)}`);
+    setText('resu-pronostico-contexto', `Ritmo ponderado: 50% promedio del mes, 30% últimos 7 días y 20% promedio del mes anterior; ${pronostico.diasRestantes} días restantes.`);
+    setText('resu-comparacion-mes', '$' + ventasMesAnteriorMismoDia.toFixed(2));
+    const cambioVsMismoDia = ventasMesAnteriorMismoDia > 0 ? ((ventasMes - ventasMesAnteriorMismoDia) / ventasMesAnteriorMismoDia) * 100 : null;
+    setText('resu-comparacion-mes-sub', cambioVsMismoDia === null ? `Mes anterior hasta el día ${diaCorteComparacion}: sin base comparable` : `${cambioVsMismoDia >= 0 ? '+' : ''}${cambioVsMismoDia.toFixed(1)}% vs. mismo tramo del mes anterior`);
+    setText('resu-crecimiento-mes-sub', `Mes actual acumulado $${ventasMes.toFixed(2)} vs. mes anterior completo $${ventasMesAnterior.toFixed(2)}`);
+    setText('resu-tendencia-7dias', '$' + ventasUltimos7Dias.toFixed(2));
+    const cambio7Dias = ventas7DiasPrevios > 0 ? ((ventasUltimos7Dias - ventas7DiasPrevios) / ventas7DiasPrevios) * 100 : null;
+    setText('resu-tendencia-7dias-sub', cambio7Dias === null ? 'No hay período previo comparable' : `${cambio7Dias >= 0 ? '+' : ''}${cambio7Dias.toFixed(1)}% frente a los 7 días previos`);
+    setText('resu-clientes-recurrentes', metricasClientes.recurrentes);
+    setText('resu-clientes-nuevos', metricasClientes.nuevosEsteMes);
+    setText('resu-clientes-inactivos', metricasClientes.inactivosRecurrentes);
+    setText('resu-clientes-actividad-sub', `De ${metricasClientes.identificables} clientes identificables por teléfono, correo o ID`);
+    renderResumenInsights({
+      pendienteCobro: pendienteCobroMes,
+      pendientesCount: delMes.filter(p => !pedidoEstaPagado(p)).length,
+      cambio7Dias,
+      productosBajoStock: contarProductosPorStock().bajo + contarProductosPorStock().sin,
+      clientesInactivos: metricasClientes.inactivosRecurrentes
+    });
+    ultimoResumenInforme = {
+      fecha: hoy,
+      ventasMes,
+      ventasMesAnterior,
+      crecimientoPorcentaje,
+      ingresosCobradosMes,
+      pendienteCobroMes,
+      pronosticoCierre: pronostico.pronosticoCierreMes,
+      pronosticoMinimo: pronostico.pronosticoMinimo,
+      pronosticoMaximo: pronostico.pronosticoMaximo,
+      ventasMesAnteriorMismoDia,
+      ventasUltimos7Dias,
+      metricasClientes
+    };
+    setText('resu-pedidos-mes', delMes.length);
+    setText('resu-pedidos-nuevos', nuevosSinAsignar.length);
+    setText('resu-pedidos-seguimiento', seguimientoNoPagado);
+    const elCrecimiento = setText('resu-crecimiento-mes', crecimientoTexto);
+    if (elCrecimiento) elCrecimiento.className = `stat-value ${crecimientoClase}`;
+    setText('resu-ventas-ayer', '$' + ventasAyer.toFixed(2));
+    setText('resu-ventas-hoy', '$' + ventasHoy.toFixed(2));
+    setText('resu-productos-mes', productosVendidosMes);
+    setText('resu-usuarios', totalUsuarios);
+    setText('resu-usuarios-sub', totalUsuarios ? `${recurrentes} recurrentes` : '—');
+
+    const recientes = [...pedidosUnicos]
+      .sort((a, b) => (parseFechaPedidoLocal(getPedidoFecha(b))?.getTime() || 0) - (parseFechaPedidoLocal(getPedidoFecha(a))?.getTime() || 0))
+      .slice(0, 6);
+    const listaRecientes = document.getElementById('resu-recientes');
+    if (listaRecientes){
+      listaRecientes.innerHTML = recientes.length ? recientes.map(p => `
+        <div class="mini-row" data-resu-pedido="${getOriginalPedidoId(p)}" style="cursor:pointer;">
+          <span class="k">${escapeHtml(p.nombre_comprador || '—')}</span>
+          <span class="v">$${Number(p.precio_compra_total || 0).toFixed(2)}</span>
+        </div>`).join('') : `<p class="hint">Todavía no hay pedidos.</p>`;
+      listaRecientes.querySelectorAll('[data-resu-pedido]').forEach(row => {
+        row.addEventListener('click', () => {
+          const p = pedidosUnicos.find(x => getOriginalPedidoId(x) === row.dataset.resuPedido);
+          if (p) showPedidoDetalle(p);
+        });
+      });
+    }
+
+    const origenesOrdenadosFull = Array.isArray(visitas.byOrigin)
+      ? visitas.byOrigin.map(item => [item.origen || 'Desconocido', Number(item.count) || 0])
+      : [];
+    const listaOrigenes = document.getElementById('resu-origenes');
+    if (listaOrigenes){
+      const origenesOrdenados = origenesOrdenadosFull.slice(0, 6);
+      listaOrigenes.innerHTML = origenesOrdenados.length ? origenesOrdenados.map(([k, v]) => `
+        <div class="mini-row"><span class="k">${escapeHtml(k)}</span><span class="v">${v}</span></div>`).join('') : `<p class="hint">Sin datos todavía.</p>`;
+    }
+
+    registrarNodeChart('resu-flow-chart', () => renderFlowChart(origenesOrdenadosFull, totalUsuarios, pedidosUnicos.length, ventasMes));
+    renderVentasMesChart(pedidosUnicos, pronostico);
+
+    /* ---------------- Productos más vendidos (del mes) ---------------- */
+    const ventasPorProducto = new Map();
+    delMes.forEach(p => {
+      const compras = Array.isArray(p.compras) ? p.compras : [];
+      compras.forEach(c => {
+        const nombre = c.name || c.nombre || 'Producto sin nombre';
+        const cantidad = Number(c.quantity ?? c.cantidad ?? 1) || 0;
+        ventasPorProducto.set(nombre, (ventasPorProducto.get(nombre) || 0) + cantidad);
+      });
+    });
+    const topProductos = Array.from(ventasPorProducto.entries()).sort((a, b) => b[1] - a[1]).slice(0, 6);
+    const listaTopProductos = document.getElementById('resu-top-productos');
+    if (listaTopProductos){
+      listaTopProductos.innerHTML = topProductos.length ? topProductos.map(([nombre, cant]) => `
+        <div class="mini-row"><span class="k">${escapeHtml(nombre)}</span><span class="v">${cant} und.</span></div>`).join('')
+        : `<p class="hint">Sin ventas este mes todavía.</p>`;
+    }
+
+    /* ---------------- Stock bajo / sin stock ---------------- */
+    const { bajo: bajoCount, sin: sinCount } = contarProductosPorStock();
+    setText('resu-stock-bajo', bajoCount);
+    setText('resu-stock-sin', sinCount);
+    const listaStock = document.getElementById('resu-stock-lista');
+    if (listaStock){
+      const conProblema = state.productos
+        .map(p => ({ p, estado: estadoStockProducto(p) }))
+        .filter(x => x.estado === 'sin' || x.estado === 'bajo')
+        .sort((a, b) => (a.estado === b.estado ? Number(a.p.stock) - Number(b.p.stock) : (a.estado === 'sin' ? -1 : 1)))
+        .slice(0, 6);
+      listaStock.innerHTML = conProblema.length ? conProblema.map(({ p, estado }) => `
+        <div class="mini-row">
+          <span class="k">${escapeHtml(p.nombre)}</span>
+          <span class="v">${estado === 'sin' ? `<span class="pill pill-danger">⚠ Sin stock</span>` : `<span class="pill pill-warn">⏳ ${p.stock} und.</span>`}</span>
+        </div>`).join('') : `<p class="hint">Todo el inventario con control de stock está en buen nivel.</p>`;
+    }
+
+    /* ---------------- Gráficas de nodos superiores ---------------- */
+    const completadosCount = asignados.length - seguimientoAbierto;
+    registrarNodeChart('resu-pipeline-chart', () => renderNodeChainChart('resu-pipeline-chart', [
+      { label: 'Nuevos', value: nuevosSinAsignar.length, display: String(nuevosSinAsignar.length), color: 'var(--blue)', bg: 'rgba(91,141,239,.16)' },
+      { label: 'En seguimiento', value: seguimientoAbierto, display: String(seguimientoAbierto), color: 'var(--teal)', bg: 'rgba(52,211,192,.16)' },
+      { label: 'Completados', value: completadosCount, display: String(completadosCount), color: 'var(--accent)', bg: 'rgba(228,46,46,.16)' }
+    ], { emptyText: 'Todavía no hay pedidos para mostrar el pipeline.' }));
+
+    const disponiblesCount = Math.max(0, state.productos.length - bajoCount - sinCount);
+    registrarNodeChart('resu-inventario-chart', () => renderNodeChainChart('resu-inventario-chart', [
+      { label: 'Disponible', value: disponiblesCount, display: String(disponiblesCount), color: 'var(--teal)', bg: 'rgba(52,211,192,.16)' },
+      { label: 'Stock bajo', value: bajoCount, display: String(bajoCount), color: '#f0ba54', bg: 'rgba(255,185,98,.16)' },
+      { label: 'Sin stock', value: sinCount, display: String(sinCount), color: 'var(--red)', bg: 'rgba(240,84,106,.16)' }
+    ], { emptyText: 'Todavía no hay productos en el inventario.' }));
+
+    /* ---------------- Rango de fechas seleccionado ---------------- */
+    const { desde, hasta, etiqueta } = calcularRangoFechas();
+    const pedidosEnRango = pedidosUnicos.filter(p => {
+      const fecha = parseFechaPedidoLocal(getPedidoFecha(p));
+      return fecha && fecha >= desde && fecha <= hasta;
+    });
+    const ventasRango = pedidosEnRango.reduce((acc, p) => acc + Number(p.precio_compra_total || 0), 0);
+    const productosRango = sumaCompras(pedidosEnRango);
+    const ticketPromedio = pedidosEnRango.length ? ventasRango / pedidosEnRango.length : 0;
+    setText('resu-rango-ventas', '$' + ventasRango.toFixed(2));
+    setText('resu-rango-label', etiqueta);
+    setText('resu-rango-pedidos', pedidosEnRango.length);
+    setText('resu-rango-productos', productosRango);
+    setText('resu-rango-ticket', '$' + ticketPromedio.toFixed(2));
+
+    /* ---------------- Horas buenas de entrada ---------------- */
+    renderHorasConexionChart(visitas);
+  }catch(e){
+    showToast('Error cargando el resumen: ' + e.message, true);
+  }
+}
+
+/* ---------------- Filtro de rango de fechas (Resumen) ---------------- */
+
+document.querySelectorAll('#resu-rango-presets [data-rango]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    state.resumenRango = { preset: btn.dataset.rango, desde: null, hasta: null };
+    document.querySelectorAll('#resu-rango-presets [data-rango]').forEach(b => b.classList.toggle('active', b === btn));
+    document.getElementById('resu-desde').value = '';
+    document.getElementById('resu-hasta').value = '';
+    loadResumen();
+  });
+});
+
+document.getElementById('resu-rango-aplicar')?.addEventListener('click', () => {
+  const desde = document.getElementById('resu-desde').value;
+  const hasta = document.getElementById('resu-hasta').value;
+  if (!desde || !hasta){
+    showToast('Selecciona fecha de inicio y de fin.', true);
+    return;
+  }
+  if (desde > hasta){
+    showToast('La fecha "Desde" no puede ser posterior a "Hasta".', true);
+    return;
+  }
+  state.resumenRango = { preset: 'custom', desde, hasta };
+  document.querySelectorAll('#resu-rango-presets [data-rango]').forEach(b => b.classList.remove('active'));
+  loadResumen();
+});
+
+document.querySelectorAll('[data-goto-inv]').forEach(card => {
+  card.addEventListener('click', () => {
+    const tab = card.dataset.gotoInv;
+    goToView('inventario');
+    const btn = document.querySelector(`#inv-tabs [data-itab="${tab}"]`);
+    if (btn) btn.click();
+  });
+});
+
+const resumenBtn = document.querySelector('.nav-item[data-view="resumen"]');
+if (resumenBtn) resumenBtn.addEventListener('click', loadResumen);
+document.getElementById('resu-export-report')?.addEventListener('click', () => {
+  if (!ultimoResumenInforme){
+    showToast('Carga el Resumen antes de exportar.', true);
+    return;
+  }
+  const r = ultimoResumenInforme;
+  const fecha = r.fecha.toLocaleDateString();
+  exportarCSV(['Métrica', 'Valor'], [
+    ['Fecha del informe', fecha],
+    ['Importe de pedidos del mes', r.ventasMes.toFixed(2)],
+    ['Total del mes anterior completo', r.ventasMesAnterior.toFixed(2)],
+    ['Variación vs mes anterior completo', r.crecimientoPorcentaje === null ? 'Nuevo mes' : `${r.crecimientoPorcentaje.toFixed(1)}%`],
+    ['Ingresos cobrados', r.ingresosCobradosMes.toFixed(2)],
+    ['Pendiente de cobro', r.pendienteCobroMes.toFixed(2)],
+    ['Pronóstico central de pedidos', r.pronosticoCierre.toFixed(2)],
+    ['Escenario bajo', r.pronosticoMinimo.toFixed(2)],
+    ['Escenario alto', r.pronosticoMaximo.toFixed(2)],
+    ['Mes anterior al mismo día', r.ventasMesAnteriorMismoDia.toFixed(2)],
+    ['Pedidos últimos 7 días', r.ventasUltimos7Dias.toFixed(2)],
+    ['Clientes recurrentes identificables', String(r.metricasClientes.recurrentes)],
+    ['Clientes nuevos del mes', String(r.metricasClientes.nuevosEsteMes)],
+    ['Recurrentes inactivos 60+ días', String(r.metricasClientes.inactivosRecurrentes)]
+  ], `resumen-buquenque-${r.fecha.toISOString().slice(0, 10)}.csv`);
+});
+document.getElementById('resu-print-report')?.addEventListener('click', () => {
+  if (!ultimoResumenInforme){
+    showToast('Carga el Resumen antes de imprimir.', true);
+    return;
+  }
+  const r = ultimoResumenInforme;
+  const printWindow = window.open('', '_blank', 'width=900,height=700');
+  if (!printWindow){
+    showToast('Permite la ventana emergente para imprimir el informe.', true);
+    return;
+  }
+  const filas = [
+    ['Importe de pedidos del mes', `$${r.ventasMes.toFixed(2)}`],
+    ['Total del mes anterior completo', `$${r.ventasMesAnterior.toFixed(2)}`],
+    ['Variación vs mes anterior completo', r.crecimientoPorcentaje === null ? 'Nuevo mes' : `${r.crecimientoPorcentaje.toFixed(1)}%`],
+    ['Ingresos cobrados', `$${r.ingresosCobradosMes.toFixed(2)}`],
+    ['Pendiente de cobro', `$${r.pendienteCobroMes.toFixed(2)}`],
+    ['Pronóstico central de cierre', `$${r.pronosticoCierre.toFixed(2)}`],
+    ['Escenario de referencia bajo', `$${r.pronosticoMinimo.toFixed(2)}`],
+    ['Escenario de referencia alto', `$${r.pronosticoMaximo.toFixed(2)}`],
+    ['Mes anterior al mismo día', `$${r.ventasMesAnteriorMismoDia.toFixed(2)}`],
+    ['Pedidos últimos 7 días', `$${r.ventasUltimos7Dias.toFixed(2)}`],
+    ['Clientes recurrentes identificables', String(r.metricasClientes.recurrentes)],
+    ['Clientes nuevos del mes', String(r.metricasClientes.nuevosEsteMes)],
+    ['Recurrentes inactivos 60+ días', String(r.metricasClientes.inactivosRecurrentes)]
+  ];
+  printWindow.document.open();
+  printWindow.document.write(`<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Informe de Casa Fresca</title><style>body{font:15px Arial,sans-serif;color:#1b1b1b;max-width:760px;margin:40px auto;padding:0 20px}h1{font-size:24px;margin-bottom:6px}p{color:#555}table{width:100%;border-collapse:collapse;margin-top:24px}th,td{padding:12px 8px;text-align:left;border-bottom:1px solid #ccc}th:last-child,td:last-child{text-align:right;font-weight:600}.note{margin-top:20px;font-size:12px;line-height:1.5}@media print{body{margin:0 auto}}</style></head><body><h1>Casa Fresca · Resumen de ventas</h1><p>Generado el ${escapeHtml(r.fecha.toLocaleDateString())}</p><table><thead><tr><th>Métrica</th><th>Valor</th></tr></thead><tbody>${filas.map(([nombre, valor]) => `<tr><td>${escapeHtml(nombre)}</td><td>${escapeHtml(valor)}</td></tr>`).join('')}</tbody></table><p class="note">Pronóstico orientativo: pondera el promedio diario del mes (50%), los últimos 7 días (30%) y el promedio del mes anterior (20%). Los escenarios muestran los ritmos históricos bajo y alto observados, no una garantía de venta.</p></body></html>`);
+  printWindow.document.close();
+  printWindow.focus();
+  printWindow.print();
+});
+document.getElementById('resu-insights')?.addEventListener('click', event => {
+  const button = event.target.closest('[data-resu-goto]');
+  if (button) goToView(button.dataset.resuGoto);
+});
+// (Se quitó la llamada automática a loadResumen() de aquí: ahora la
+// dispara bootPanel() una vez confirmada la sesión, para no llamar a la
+// API antes de tiempo y disparar un 401 innecesario.)
+
+/* ---------------------- Menú lateral en móvil ---------------------- */
+
+(function initMobileNav(){
+  const menuBtn = document.getElementById('menu-btn');
+  const overlay = document.getElementById('nav-overlay');
+  const sidebar = document.getElementById('sidebar');
+  if (!menuBtn || !overlay || !sidebar) return;
+
+  const toggle = (open) => {
+    sidebar.classList.toggle('open', open);
+    overlay.classList.toggle('open', open);
+  };
+  menuBtn.addEventListener('click', () => toggle(true));
+  overlay.addEventListener('click', () => toggle(false));
+  document.querySelectorAll('.nav-item').forEach(btn => btn.addEventListener('click', () => toggle(false)));
+
+  const topbarTitle = document.getElementById('topbar-title');
+  if (topbarTitle){
+    document.querySelectorAll('.nav-item').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const clone = btn.cloneNode(true);
+        clone.querySelectorAll('.nav-badge').forEach(b => b.remove());
+        topbarTitle.textContent = clone.textContent.trim();
+      });
+    });
+  }
+})();
+
+/* =========================================================================
+   VENTAS POR PRODUCTO — verificación de stock vs. pedidos
+   Dado un producto, calcula cuántas unidades se han pedido dentro de un
+   rango (por fecha o por número de pedido), lo compara con el stock actual
+   y calcula la salida diaria promedio en ese rango. Reutiliza los mismos
+   endpoints/datos que ya usan Pedidos y Resumen, sin modificar ni depender
+   de sus funciones para no romper nada existente.
+   ========================================================================= */
+
+state.stockCheck = {
+  prodId: null,
+  modo: 'fecha',
+  rango: { preset: '30dias', desde: null, hasta: null },
+  ordenDesde: null,
+  ordenHasta: null,
+  pedidosCache: null
+};
+
+function normalizeIdComparableFrontend(value){
+  return String(value ?? '').trim().toLowerCase();
+}
+
+// Determina si un ítem de "compras" de un pedido corresponde al producto
+// dado. Primero intenta por id (igual que hace el backend al descontar
+// stock); si el ítem no trae ningún id, cae a comparar el nombre ya
+// normalizado (sin tildes/mayúsculas) para no perder pedidos antiguos.
+function compraCoincideConProducto(item, prod){
+  if (!item || !prod) return false;
+  const posiblesIds = [item.id, item.productId, item.product_id, item.productoId, item.producto_id]
+    .filter(v => v !== undefined && v !== null && String(v).trim() !== '')
+    .map(normalizeIdComparableFrontend);
+  if (posiblesIds.length) return posiblesIds.includes(normalizeIdComparableFrontend(prod.id));
+  const nombreItem = normalizeText(item.name || item.nombre || '');
+  return !!nombreItem && nombreItem === normalizeText(prod.nombre);
+}
+
+function cantidadProductoEnPedido(p, prod){
+  const compras = Array.isArray(p.compras) ? p.compras : [];
+  return compras.reduce((acc, item) => acc + (compraCoincideConProducto(item, prod) ? (Number(item.quantity ?? item.cantidad ?? 1) || 0) : 0), 0);
+}
+
+// Trae y combina pedidos nuevos + en seguimiento (deduplicados por pedido
+// original), igual que hace loadResumen, pero cacheado aparte para esta
+// herramienta y sin tocar state.pedidosNuevos/state.pedidosSeguimiento.
+async function cargarStockCheckPedidos(forzar = false){
+  if (state.stockCheck.pedidosCache && !forzar) return state.stockCheck.pedidosCache;
+  const data = await apiFetch('/api/panel/pedidos?compact=1', { force: forzar });
+  const nuevos = data.pedidos || [];
+  const asignados = data.pedidosAsignados || [];
+  const asignadosIds = new Set(asignados.map(p => getOriginalPedidoId(p)));
+  const nuevosSinAsignar = nuevos.filter(p => !asignadosIds.has(getOriginalPedidoId(p)));
+  const mapa = new Map();
+  [...nuevosSinAsignar, ...asignados].forEach(p => {
+    const id = getOriginalPedidoId(p) || `tmp-${Math.random()}`;
+    if (!mapa.has(id) || p.fecha_asignacion) mapa.set(id, p);
+  });
+  state.stockCheck.pedidosCache = Array.from(mapa.values());
+  return state.stockCheck.pedidosCache;
+}
+
+function calcularRangoFechasStockCheck(){
+  const { preset, desde, hasta } = state.stockCheck.rango;
+  const hoy = new Date();
+  const inicioDia = (d) => { const x = new Date(d); x.setHours(0,0,0,0); return x; };
+  const finDia = (d) => { const x = new Date(d); x.setHours(23,59,59,999); return x; };
+  if (preset === 'custom' && desde && hasta) return { desde: inicioDia(new Date(desde)), hasta: finDia(new Date(hasta)), etiqueta: `${desde} a ${hasta}` };
+  if (preset === 'ayer'){ const ayer = new Date(hoy); ayer.setDate(ayer.getDate() - 1); return { desde: inicioDia(ayer), hasta: finDia(ayer), etiqueta: 'Ayer' }; }
+  if (preset === '7dias'){ const inicio = new Date(hoy); inicio.setDate(inicio.getDate() - 6); return { desde: inicioDia(inicio), hasta: finDia(hoy), etiqueta: 'Últimos 7 días' }; }
+  if (preset === '30dias'){ const inicio = new Date(hoy); inicio.setDate(inicio.getDate() - 29); return { desde: inicioDia(inicio), hasta: finDia(hoy), etiqueta: 'Últimos 30 días' }; }
+  if (preset === 'mes'){ const inicio = new Date(hoy.getFullYear(), hoy.getMonth(), 1); return { desde: inicioDia(inicio), hasta: finDia(hoy), etiqueta: 'Este mes' }; }
+  if (preset === 'mesanterior'){ const inicio = new Date(hoy.getFullYear(), hoy.getMonth() - 1, 1); const fin = new Date(hoy.getFullYear(), hoy.getMonth(), 0); return { desde: inicioDia(inicio), hasta: finDia(fin), etiqueta: 'Mes anterior' }; }
+  return { desde: inicioDia(hoy), hasta: finDia(hoy), etiqueta: 'Hoy' };
+}
+
+function renderStockCheckProductoSeleccionado(prod){
+  const wrap = document.getElementById('stockchk-selected');
+  const search = document.getElementById('stockchk-search');
+  const filtroSection = document.getElementById('stockchk-filtro-section');
+  const emptyHint = document.getElementById('stockchk-empty-hint');
+  if (!wrap || !search || !filtroSection || !emptyHint) return;
+  if (!prod){
+    wrap.hidden = true;
+    search.hidden = false;
+    search.value = '';
+    filtroSection.hidden = true;
+    document.getElementById('stockchk-resultados').hidden = true;
+    emptyHint.hidden = false;
+    return;
+  }
+  emptyHint.hidden = true;
+  wrap.hidden = false;
+  search.hidden = true;
+  filtroSection.hidden = false;
+  setText('stockchk-selected-nombre', prod.nombre);
+  const estado = estadoStockProducto(prod);
+  const estadoTxt = estado === 'sin' ? 'Sin stock' : estado === 'bajo' ? 'Stock bajo' : estado === 'na' ? 'Sin control de stock' : 'Stock ok';
+  setText('stockchk-selected-meta', `Stock actual: ${prod.stock ?? 0} · ${estadoTxt}`);
+}
+
+function seleccionarProductoStockCheck(prodId){
+  state.stockCheck.prodId = prodId || null;
+  const prod = prodId ? state.productos.find(p => String(p.id) === String(prodId)) : null;
+  renderStockCheckProductoSeleccionado(prod);
+  if (prod) calcularStockCheck();
+}
+
+function abrirModalVentasProducto(prodId){
+  state.stockCheck.pedidosCache = null;
+  state.stockCheck.modo = 'fecha';
+  state.stockCheck.rango = { preset: '30dias', desde: null, hasta: null };
+  state.stockCheck.ordenDesde = null;
+  state.stockCheck.ordenHasta = null;
+
+  const suggestions = document.getElementById('stockchk-suggestions');
+  if (suggestions){ suggestions.hidden = true; suggestions.innerHTML = ''; }
+
+  document.querySelectorAll('#stockchk-mode-tabs [data-mode]').forEach(b => b.classList.toggle('active', b.dataset.mode === 'fecha'));
+  const modoFecha = document.getElementById('stockchk-modo-fecha');
+  const modoPedidos = document.getElementById('stockchk-modo-pedidos');
+  if (modoFecha) modoFecha.hidden = false;
+  if (modoPedidos) modoPedidos.hidden = true;
+
+  document.querySelectorAll('#stockchk-rango-presets [data-rango]').forEach(b => b.classList.toggle('active', b.dataset.rango === '30dias'));
+  const desdeInput = document.getElementById('stockchk-desde');
+  const hastaInput = document.getElementById('stockchk-hasta');
+  const ordenDesdeInput = document.getElementById('stockchk-orden-desde');
+  const ordenHastaInput = document.getElementById('stockchk-orden-hasta');
+  if (desdeInput) desdeInput.value = '';
+  if (hastaInput) hastaInput.value = '';
+  if (ordenDesdeInput) ordenDesdeInput.value = '';
+  if (ordenHastaInput) ordenHastaInput.value = '';
+
+  seleccionarProductoStockCheck(prodId || null);
+  openModal('modal-stock-check');
+}
+
+document.getElementById('inv-check-ventas-btn')?.addEventListener('click', () => abrirModalVentasProducto(null));
+document.getElementById('stockchk-clear')?.addEventListener('click', () => seleccionarProductoStockCheck(null));
+
+/* -------- Buscador de producto (ignora tildes/mayúsculas, ej. Café/cafe) -------- */
+(function initStockCheckBuscador(){
+  const input = document.getElementById('stockchk-search');
+  const lista = document.getElementById('stockchk-suggestions');
+  if (!input || !lista) return;
+
+  const mostrarSugerencias = () => {
+    const query = normalizeText(input.value.trim());
+    const productos = query
+      ? state.productos.filter(p => normalizeText(p.nombre).includes(query))
+      : state.productos;
+    const top = productos.slice(0, 8);
+    lista.innerHTML = top.length
+      ? top.map((p, i) => `
+        <button type="button" class="autocomplete-item${i === 0 ? ' active' : ''}" data-prod-id="${escapeHtml(String(p.id))}">
+          <span class="autocomplete-item-name">${escapeHtml(p.nombre)}</span>
+          <span class="autocomplete-item-price">Stock: ${p.stock ?? 0}</span>
+        </button>`).join('')
+      : `<div class="autocomplete-empty">Sin coincidencias</div>`;
+    lista.hidden = false;
+// Asegurar que el dropdown agrandado quede completamente visible dentro
+    // del modal-body (que scrollea): si sobresale por abajo, lo llevamos a la
+    // vista automáticamente para que no quede recortado por el borde del panel.
+    const bdMod = lista.closest('.modal-body');
+    if (bdMod && typeof bdMod.scrollTo === 'function'){
+      const lr = lista.getBoundingClientRect();
+      const br = bdMod.getBoundingClientRect();
+      if (lr.bottom > br.bottom){
+        bdMod.scrollTo({ top: bdMod.scrollTop + (lr.bottom - br.bottom) + 12, behavior: 'smooth' });
+      }
+    }
+  };
+
+  input.addEventListener('focus', mostrarSugerencias);
+  input.addEventListener('input', mostrarSugerencias);
+
+  input.addEventListener('keydown', (e) => {
+    const items = Array.from(lista.querySelectorAll('.autocomplete-item'));
+    if (!items.length) return;
+    let activeIdx = items.findIndex(it => it.classList.contains('active'));
+    if (e.key === 'ArrowDown'){
+      e.preventDefault();
+      activeIdx = Math.min(items.length - 1, activeIdx + 1);
+      items.forEach(it => it.classList.remove('active'));
+      items[activeIdx].classList.add('active');
+      items[activeIdx].scrollIntoView({ block: 'nearest' });
+    } else if (e.key === 'ArrowUp'){
+      e.preventDefault();
+      activeIdx = Math.max(0, activeIdx - 1);
+      items.forEach(it => it.classList.remove('active'));
+      items[activeIdx].classList.add('active');
+      items[activeIdx].scrollIntoView({ block: 'nearest' });
+    } else if (e.key === 'Enter'){
+      e.preventDefault();
+      const activo = items[activeIdx] || items[0];
+      if (activo) seleccionarProductoStockCheck(activo.dataset.prodId);
+      lista.hidden = true;
+    } else if (e.key === 'Escape'){
+      lista.hidden = true;
+    }
+  });
+
+  lista.addEventListener('mousedown', (e) => {
+    const item = e.target.closest && e.target.closest('[data-prod-id]');
+    if (!item) return;
+    e.preventDefault();
+    seleccionarProductoStockCheck(item.dataset.prodId);
+    lista.hidden = true;
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!lista.hidden && !lista.contains(e.target) && e.target !== input) lista.hidden = true;
+  });
+})();
+
+/* --------------------------- Selector de modo de rango --------------------------- */
+document.querySelectorAll('#stockchk-mode-tabs [data-mode]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    state.stockCheck.modo = btn.dataset.mode;
+    document.querySelectorAll('#stockchk-mode-tabs [data-mode]').forEach(b => b.classList.toggle('active', b === btn));
+    document.getElementById('stockchk-modo-fecha').hidden = state.stockCheck.modo !== 'fecha';
+    document.getElementById('stockchk-modo-pedidos').hidden = state.stockCheck.modo !== 'pedidos';
+    if (state.stockCheck.prodId) calcularStockCheck();
+  });
+});
+
+document.querySelectorAll('#stockchk-rango-presets [data-rango]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    state.stockCheck.rango = { preset: btn.dataset.rango, desde: null, hasta: null };
+    document.querySelectorAll('#stockchk-rango-presets [data-rango]').forEach(b => b.classList.toggle('active', b === btn));
+    document.getElementById('stockchk-desde').value = '';
+    document.getElementById('stockchk-hasta').value = '';
+    if (state.stockCheck.prodId) calcularStockCheck();
+  });
+});
+
+document.getElementById('stockchk-rango-aplicar')?.addEventListener('click', () => {
+  const desde = document.getElementById('stockchk-desde').value;
+  const hasta = document.getElementById('stockchk-hasta').value;
+  if (!desde || !hasta) return showToast('Selecciona fecha de inicio y de fin.', true);
+  if (desde > hasta) return showToast('La fecha "Desde" no puede ser posterior a "Hasta".', true);
+  state.stockCheck.rango = { preset: 'custom', desde, hasta };
+  document.querySelectorAll('#stockchk-rango-presets [data-rango]').forEach(b => b.classList.remove('active'));
+  if (state.stockCheck.prodId) calcularStockCheck();
+});
+
+document.getElementById('stockchk-orden-aplicar')?.addEventListener('click', () => {
+  const desde = document.getElementById('stockchk-orden-desde').value;
+  const hasta = document.getElementById('stockchk-orden-hasta').value;
+  if (desde === '' || hasta === '') return showToast('Indica el número de pedido inicial y final.', true);
+  if (Number(desde) > Number(hasta)) return showToast('El pedido "Desde" no puede ser mayor al pedido "Hasta".', true);
+  state.stockCheck.ordenDesde = Number(desde);
+  state.stockCheck.ordenHasta = Number(hasta);
+  if (state.stockCheck.prodId) calcularStockCheck();
+});
+
+/* ------------------------------ Cálculo principal ------------------------------ */
+async function calcularStockCheck(){
+  const prod = state.productos.find(p => String(p.id) === String(state.stockCheck.prodId));
+  if (!prod) return;
+  const resultados = document.getElementById('stockchk-resultados');
+  const listaEl = document.getElementById('stockchk-pedidos-list');
+  if (!resultados || !listaEl) return;
+  resultados.hidden = false;
+  listaEl.innerHTML = 'Cargando…';
+  setText('stockchk-stock-actual', prod.stock ?? 0);
+
+  let pedidos;
+  try{
+    pedidos = await cargarStockCheckPedidos();
+  }catch(e){
+    showToast('Error cargando pedidos: ' + e.message, true);
+    listaEl.innerHTML = `<p class="hint">No se pudieron cargar los pedidos.</p>`;
+    return;
+  }
+
+  let pedidosEnRango = [];
+  let etiquetaRango = '—';
+  let dias = 1;
+  let rangoValido = true;
+
+  if (state.stockCheck.modo === 'pedidos'){
+    const desde = state.stockCheck.ordenDesde;
+    const hasta = state.stockCheck.ordenHasta;
+    if (desde === null || hasta === null || Number.isNaN(desde) || Number.isNaN(hasta)){
+      rangoValido = false;
+      etiquetaRango = 'Indica un rango de pedidos y pulsa "Aplicar rango"';
+    } else {
+      pedidosEnRango = pedidos.filter(p => {
+        const num = getPedidoNumeroValor(p);
+        return !Number.isNaN(num) && num >= desde && num <= hasta;
+      });
+      etiquetaRango = `Pedidos #${desde} a #${hasta}`;
+      const fechasValidas = pedidosEnRango.map(p => parseFechaPedidoLocal(getPedidoFecha(p))).filter(Boolean);
+      if (fechasValidas.length){
+        const min = new Date(Math.min(...fechasValidas));
+        const max = new Date(Math.max(...fechasValidas));
+        dias = Math.max(1, Math.round((max - min) / 86400000) + 1);
+      }
+    }
+  } else {
+    const { desde, hasta, etiqueta } = calcularRangoFechasStockCheck();
+    etiquetaRango = etiqueta;
+    if (desde && hasta){
+      pedidosEnRango = pedidos.filter(p => {
+        const fecha = parseFechaPedidoLocal(getPedidoFecha(p));
+        return fecha && fecha >= desde && fecha <= hasta;
+      });
+      dias = Math.max(1, Math.round((hasta - desde) / 86400000) + 1);
+    }
+  }
+
+  if (!rangoValido){
+    setText('stockchk-rango-label', etiquetaRango);
+    setText('stockchk-total-unidades', '—');
+    setText('stockchk-total-pedidos', '—');
+    setText('stockchk-salida-diaria', '—');
+    setText('stockchk-dias-sub', '—');
+    setText('stockchk-autonomia', '—');
+    listaEl.innerHTML = `<p class="hint">Indica un rango de números de pedido y pulsa "Aplicar rango".</p>`;
+    return;
+  }
+
+  const conProducto = pedidosEnRango
+    .map(p => ({ p, cantidad: cantidadProductoEnPedido(p, prod) }))
+    .filter(x => x.cantidad > 0)
+    .sort((a, b) => new Date(getPedidoFecha(b.p)) - new Date(getPedidoFecha(a.p)));
+
+  const totalUnidades = conProducto.reduce((acc, x) => acc + x.cantidad, 0);
+  const salidaDiaria = totalUnidades / dias;
+  const stockActual = Number(prod.stock ?? 0);
+  const autonomiaTxt = salidaDiaria > 0
+    ? `≈ ${(stockActual / salidaDiaria).toFixed(1)} días`
+    : (stockActual > 0 ? 'Sin salidas en el rango' : '—');
+
+  setText('stockchk-total-unidades', totalUnidades);
+  setText('stockchk-rango-label', etiquetaRango);
+  setText('stockchk-total-pedidos', conProducto.length);
+  setText('stockchk-stock-actual', stockActual);
+  setText('stockchk-salida-diaria', salidaDiaria.toFixed(2) + ' und/día');
+  setText('stockchk-dias-sub', `sobre ${dias} día${dias === 1 ? '' : 's'} en el rango`);
+  setText('stockchk-autonomia', autonomiaTxt);
+
+  const autonomiaEl = document.getElementById('stockchk-autonomia');
+  if (autonomiaEl){
+    const critico = prod.aplicar_stock && salidaDiaria > 0 && (stockActual / salidaDiaria) <= 3;
+    autonomiaEl.classList.toggle('stockchk-diff-warn', critico);
+  }
+
+  listaEl.innerHTML = conProducto.length ? conProducto.map(({ p, cantidad }) => `
+    <div class="mini-row" data-stockchk-pedido="${escapeHtml(getOriginalPedidoId(p))}" style="cursor:pointer;">
+      <span class="k">${escapeHtml(parseFechaPedidoLocal(getPedidoFecha(p))?.toLocaleDateString() || '—')} · Orden ${escapeHtml(getPedidoNumero(p) || '—')} · ${escapeHtml(p.nombre_comprador || '—')}</span>
+      <span class="v">${cantidad} und.</span>
+    </div>`).join('') : `<p class="hint">No se encontraron pedidos con este producto en el rango seleccionado.</p>`;
+
+  listaEl.querySelectorAll('[data-stockchk-pedido]').forEach(row => {
+    row.addEventListener('click', () => {
+      const item = conProducto.find(x => getOriginalPedidoId(x.p) === row.dataset.stockchkPedido);
+      if (item) showPedidoDetalle(item.p);
+    });
+  });
+}

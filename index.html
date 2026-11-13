@@ -1,674 +1,1260 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
-    <meta charset="UTF-8">
-    <!-- Compatibilidad adicional: asegurar que navegadores/servidores detecten UTF-8 -->
-    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dashboard de Datos</title>
-
-    <!-- Favicon de ejemplo -->
-    <link rel="icon" href="https://placehold.co/32x32/4A90E2/FFFFFF?text=B" type="image/png">
-
-    <!-- CSS Modularizado -->
-    <link rel="stylesheet" href="Css/main.css">
-    <link rel="stylesheet" href="Css/loading.css">
-    <link rel="stylesheet" href="Css/settings.css">
-    <link rel="stylesheet" href="Css/modal-github.css">
-    <link rel="stylesheet" href="Css/inventory.css">
-    <link rel="stylesheet" href="Css/inventory-modal.css">
-    <link rel="stylesheet" href="Css/tools.css">
-    <link rel="stylesheet" href="Css/globe.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.7.2/css/all.min.css">
-        <script type="importmap">
-        {
-            "imports": {
-                "three": "https://unpkg.com/three@0.154.0/build/three.module.js"
-            }
-        }
-        </script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Panel de Gestión</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer" />
+<link rel="manifest" href="manifest.json">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="theme-color" content="#0b0e14">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Analytics">
+<link rel="stylesheet" href="styles.css?v=19">
 </head>
 <body>
-    <!-- Loading Panel - Ultra Moderno -->
-    <div id="loading-panel" class="loading-panel">
-        <!-- Fondo animado con partículas -->
-        <div class="loading-bg-particles">
-            <div class="loading-particle" style="--delay: 0s; --duration: 8s;"></div>
-            <div class="loading-particle" style="--delay: 1s; --duration: 10s;"></div>
-            <div class="loading-particle" style="--delay: 2s; --duration: 9s;"></div>
-            <div class="loading-particle" style="--delay: 3s; --duration: 11s;"></div>
-            <div class="loading-particle" style="--delay: 4s; --duration: 7s;"></div>
-        </div>
-        
-        <div class="loading-panel-content">
-            <!-- Logo animado -->
-            <div class="loading-panel-header">
-                <div class="loading-panel-icon">
-                    <svg class="loading-icon-svg" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-                        <defs>
-                            <linearGradient id="iconGradient" x1="0%" y1="0%" x2="100%" y2="100%">
-                                <stop offset="0%" style="stop-color:#d60000;stop-opacity:1" />
-                                <stop offset="100%" style="stop-color:#ff8c8c;stop-opacity:1" />
-                            </linearGradient>
-                        </defs>
-                        <circle cx="50" cy="50" r="45" fill="none" stroke="url(#iconGradient)" stroke-width="2" opacity="0.3"/>
-                        <path d="M 30 60 L 50 30 L 70 60" fill="none" stroke="url(#iconGradient)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-                        <path d="M 30 60 L 70 60" stroke="url(#iconGradient)" stroke-width="2" opacity="0.5"/>
-                    </svg>
-                </div>
-                
-                <div class="loading-panel-text">
-                    <h1 class="loading-panel-title">Dashboard Casa Fresca</h1>
-                    <p class="loading-panel-subtitle">Preparando tu panel de análisis...</p>
-                </div>
-            </div>
-            
-            <!-- Barra de progreso mejorada -->
-            <div class="loading-progress-container">
-                <div class="loading-progress-bar">
-                    <div class="loading-progress-fill" id="loading-progress-fill"></div>
-                    <div class="loading-progress-shimmer"></div>
-                </div>
-                <div class="loading-progress-text">
-                    <span id="loading-percent" class="loading-percent-value">0%</span>
-                </div>
-            </div>
-            
-            <!-- Panel de estado detallado -->
-            <div class="loading-status-panel">
-                <div class="loading-status-item">
-                    <span class="loading-status-icon"><i class="fas fa-server"></i></span>
-                    <div class="loading-status-content">
-                        <span class="loading-status-label">Servidor</span>
-                        <span class="loading-status-value" id="loading-status-server">Conectando...</span>
-                    </div>
-                </div>
-                
-                <div class="loading-status-item">
-                    <span class="loading-status-icon"><i class="fas fa-database"></i></span>
-                    <div class="loading-status-content">
-                        <span class="loading-status-label">Datos</span>
-                        <span class="loading-status-value" id="loading-status-data">Cargando...</span>
-                    </div>
-                </div>
-                
-                <div class="loading-status-item">
-                    <span class="loading-status-icon"><i class="fas fa-tachometer-alt"></i></span>
-                    <div class="loading-status-content">
-                        <span class="loading-status-label">Velocidad</span>
-                        <span class="loading-status-value" id="loading-status-speed">—</span>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- Animación de carga -->
-            <div class="loading-dots-container">
-                <div class="loading-dot"></div>
-                <div class="loading-dot"></div>
-                <div class="loading-dot"></div>
-            </div>
-            
-            <!-- Mini estadísticas -->
-            <div class="loading-mini-stats">
-                <div class="loading-mini-stat">
-                    <span class="loading-mini-label">Paso</span>
-                    <span class="loading-mini-value" id="loading-step">1/8</span>
-                </div>
-                <div class="loading-mini-stat separator"></div>
-                <div class="loading-mini-stat">
-                    <span class="loading-mini-label">Tiempo</span>
-                    <span class="loading-mini-value" id="loading-time">0s</span>
-                </div>
-            </div>
-        </div>
+
+<!-- ===================== GATE 1: BACKEND ===================== -->
+<!-- Se muestra primero si todavía no hay URL de backend guardada. Hasta que
+     no se guarde una URL válida, no aparece ni el login ni el panel. -->
+<div id="backend-gate" class="auth-gate">
+  <div class="auth-card">
+    <div class="auth-header">
+      <span class="brand-mark" style="font-size:28px;">▣</span>
+      <h2>Configurar backend</h2>
+      <p>Antes de continuar, indica la URL de tu servidor</p>
+    </div>
+    <div id="backend-error" class="auth-error" style="display:none;"></div>
+    <label>URL del backend
+      <input type="text" id="backend-url-input" placeholder="https://tu-backend.onrender.com" autocomplete="off">
+    </label>
+    <button type="button" class="btn btn-primary" id="backend-save" style="width:100%;">Guardar y continuar</button>
+  </div>
+</div>
+
+<!-- ===================== GATE 2: LOGIN ===================== -->
+<!-- Solo aparece después de guardar el backend. El panel (.app) permanece
+     oculto por CSS (clase "locked") hasta que el login sea exitoso. -->
+<div id="auth-gate" class="auth-gate">
+  <div class="auth-card">
+    <div class="auth-header">
+      <span class="brand-mark" style="font-size:28px;">▣</span>
+      <h2>Panel de Gestión</h2>
+      <p>Inicia sesión para continuar</p>
+    </div>
+    <div id="auth-error" class="auth-error" style="display:none;"></div>
+    <label>Usuario
+      <input type="text" id="auth-username" autocomplete="username">
+    </label>
+    <label>Contraseña
+      <input type="password" id="auth-password" autocomplete="current-password">
+    </label>
+    <button type="button" class="btn btn-primary" id="auth-submit" style="width:100%;">Entrar</button>
+
+    <button type="button" class="auth-link" id="auth-toggle-advanced">¿Problemas para iniciar sesión?</button>
+
+    <div id="auth-advanced-panel" style="display:none;">
+      <label>URL del backend
+        <input type="text" id="auth-api-url" placeholder="https://tu-backend.onrender.com" autocomplete="off">
+      </label>
+      <button type="button" class="btn btn-secondary" id="auth-save-url" style="width:100%;">Guardar URL</button>
+      <button type="button" class="btn btn-danger" id="auth-clear-storage" style="width:100%; margin-top:8px;">Borrar datos guardados del navegador</button>
+      <p class="hint" id="auth-advanced-result" style="margin-top:8px;"></p>
+    </div>
+  </div>
+</div>
+
+<style>
+  .auth-gate {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    background: rgba(10, 12, 18, 0.92);
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .auth-gate.open { display: flex; }
+  .auth-card {
+    width: 100%;
+    max-width: 340px;
+    background: #131722;
+    border: 1px solid #262c3d;
+    border-radius: 14px;
+    padding: 28px 24px;
+    color: #e7e9ee;
+    box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+  }
+  .auth-header { text-align: center; margin-bottom: 20px; }
+  .auth-header h2 { margin: 8px 0 4px; font-size: 18px; }
+  .auth-header p { margin: 0; font-size: 13px; color: #8891a8; }
+  .auth-card label {
+    display: block;
+    font-size: 13px;
+    margin-bottom: 12px;
+    color: #b6bcce;
+  }
+  .auth-card input {
+    width: 100%;
+    margin-top: 6px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid #2b3244;
+    background: #0c0f17;
+    color: #e7e9ee;
+    font-size: 14px;
+    box-sizing: border-box;
+  }
+  .auth-card input:focus { outline: none; border-color: #5b7cfa; }
+  .auth-error {
+    background: #2a1414;
+    border: 1px solid #5a2323;
+    color: #ff8a8a;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 13px;
+    margin-bottom: 14px;
+  }
+  .auth-link {
+    display: block;
+    width: 100%;
+    background: none;
+    border: none;
+    color: #8891a8;
+    font-size: 12px;
+    text-decoration: underline;
+    text-align: center;
+    margin-top: 14px;
+    padding: 4px;
+    cursor: pointer;
+  }
+  .auth-link:hover { color: #b6bcce; }
+  #auth-advanced-panel { margin-top: 14px; padding-top: 14px; border-top: 1px solid #262c3d; }
+  .btn-secondary {
+    background: rgba(91,124,250,.12);
+    border: 1px solid rgba(91,124,250,.35);
+    color: #9fb2ff;
+  }
+  .btn-secondary:hover { background: rgba(91,124,250,.2); }
+</style>
+
+<!-- La clase "locked" oculta TODO el panel (display:none) hasta que el
+     login sea válido. Se quita únicamente desde unlockApp() en app.js. -->
+<div class="app locked">
+
+  <!-- Overlay para el drawer en móvil -->
+  <div id="nav-overlay" class="nav-overlay"></div>
+
+  <!-- Sidebar -->
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <span class="brand-mark"><i class="fa-solid fa-bowl-food"></i></span>
+      <div class="brand-text">
+        <h1>Casa Fresca</h1>
+        <p>Manager</p>
+      </div>
     </div>
 
-    <header class="app-header">
-        <div class="header-content">
-            <button class="hamburger-menu" id="hamburger-btn" aria-label="Menú">
-                <span></span>
-                <span></span>
-                <span></span>
-            </button>
-            <div class="app-logo">
-                <img src="Img/LOGO.png" alt="Casa Fresca" class="app-logo-img">
-                <h1>Dashboard</h1>
-            </div>
-            <span class="header-status"><i class="fas fa-circle status-indicator"></i> Conectado</span>
+    <nav class="nav">
+      <div class="nav-section">
+        <span class="nav-section-label">General</span>
+        <button class="nav-item active" data-view="resumen">
+          <span class="nav-ico"><i class="fa-solid fa-chart-pie"></i></span> Resumen
+        </button>
+      </div>
+
+      <div class="nav-section">
+        <span class="nav-section-label">Gestión</span>
+        <button class="nav-item" data-view="inventario">
+          <span class="nav-ico"><i class="fa-solid fa-boxes-stacked"></i></span> Inventario
+          <span class="nav-badge" id="badge-inventario">0</span>
+        </button>
+        <button class="nav-item" data-view="packs">
+          <span class="nav-ico"><i class="fa-solid fa-gift"></i></span> Packs
+        </button>
+        <button class="nav-item" data-view="pedidos">
+          <span class="nav-ico"><i class="fa-solid fa-truck-fast"></i></span> Pedidos
+          <span class="nav-badge" id="badge-pedidos">0</span>
+        </button>
+      </div>
+
+      <div class="nav-section">
+        <span class="nav-section-label">Clientes</span>
+        <button class="nav-item" data-view="usuarios">
+          <span class="nav-ico"><i class="fa-solid fa-users"></i></span> Registro de usuarios
+        </button>
+        <button class="nav-item" data-view="notificaciones">
+          <span class="nav-ico"><i class="fa-solid fa-bell"></i></span> Notificaciones
+        </button>
+      </div>
+
+      <div class="nav-section">
+        <span class="nav-section-label">Sistema</span>
+        <button class="nav-item" data-view="config">
+          <span class="nav-ico"><i class="fa-solid fa-plug-circle-bolt"></i></span> Conexión
+        </button>
+      </div>
+    </nav>
+
+    <div class="sidebar-footer">
+      <div class="conn-status" id="connStatus">
+        <span class="conn-status-icon"><span class="dot"></span></span>
+        <div class="conn-status-text">
+          <span class="conn-status-title">Backend</span>
+          <span id="connStatusText">Sin verificar</span>
         </div>
+      </div>
+
+      <div class="presence-indicator presence-sidebar" role="status" aria-live="polite" title="Dispositivos con una sesión activa en Analytics">
+        <span class="presence-dot" aria-hidden="true"></span>
+        <span class="presence-copy"><span>Analytics en línea</span><strong data-presence-count>—</strong></span>
+      </div>
+
+      <button type="button" id="logout-btn" class="nav-item nav-item-logout">
+        <span class="nav-ico"><i class="fa-solid fa-right-from-bracket"></i></span> Cerrar sesión
+      </button>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <div class="main">
+
+    <div id="offline-banner" class="offline-banner" hidden>⚠ Sin conexión — mostrando los últimos datos guardados.</div>
+
+    <header class="topbar">
+      <button id="menu-btn" class="icon-btn" aria-label="Abrir menú">☰</button>
+      <h1 id="topbar-title">Panel</h1>
+      <div class="presence-indicator presence-mobile" role="status" aria-live="polite" title="Dispositivos con una sesión activa en Analytics">
+        <span class="presence-dot" aria-hidden="true"></span><strong data-presence-count>—</strong>
+      </div>
     </header>
 
-    <!-- Overlay para cerrar menú (mobile) -->
-    <div class="menu-overlay" id="menu-overlay"></div>
+    <main class="content">
 
-    <div class="main-wrapper">
-        <!-- Menú Lateral -->
-        <nav class="sidebar-menu" id="sidebar-menu">
-            <div class="menu-header">
-                <h2><i class="fas fa-bars" style="margin-right: 0.4rem;"></i>Nav</h2>
-                <button class="close-menu" id="close-menu" aria-label="Cerrar menú">&times;</button>
-            </div>
-            <ul class="menu-list">
-                <li><a href="#" class="menu-item active" data-view="dashboard">
-                    <svg class="menu-icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" xmlns="http://www.w3.org/2000/svg">
-                        <rect x="3" y="3" width="8" height="8" rx="2"/>
-                        <rect x="13" y="3" width="8" height="8" rx="5"/>
-                        <rect x="3" y="13" width="8" height="8" rx="2"/>
-                        <rect x="13" y="13" width="8" height="8" rx="2"/>
-                    </svg>
-                    Overview
-                </a></li>
-                <li><a href="#" class="menu-item" data-view="inventory"><i class="fas fa-boxes"></i> Inventario</a></li>
-                <li class="menu-separator"></li>
-                <li><a href="#" class="menu-item" data-view="server"><i class="fas fa-server"></i> Server</a></li>
-                <li class="menu-separator"></li>
-                <li><a href="#" class="menu-item" data-view="settings"><i class="fas fa-cog"></i> Ajustes</a></li>
-            </ul>
-        </nav>
-
-        <!-- Contenido Principal -->
-        <main class="content">
-        <!-- Vista Dashboard -->
-        <div id="dashboard-view" class="view-content active">
-            <header class="header">
-                <div class="header-top">
-                    <div class="search-bar">
-                        <input type="text" id="search-data" placeholder="Buscar en datos..." class="input-light">
-                        <button class="search-btn"><i class="fas fa-search"></i></button>
-                    </div>
-                    
-                    <div class="header-actions">
-                        <button class="btn btn-primary" id="refresh-data">
-                            <i class="fas fa-sync-alt"></i> Actualizar
-                        </button>
-
-                        <button id="open-filters" class="btn btn-outline" aria-haspopup="dialog" aria-controls="filters-modal">
-                            <i class="fas fa-filter"></i> Filtros
-                        </button>
-                    </div>
-                </div>
-                <div class="header-main">
-                    <div class="header-stats">
-                        <div class="stat-card primary">
-                            <i class="fas fa-chart-pie"></i>
-                            <div class="stat-content">
-                                <span class="stat-value" id="total-orders">0</span>
-                                <span class="stat-label">Pedidos Totales</span>
-                            </div>
-                            <div class="currency-panel cup">
-                                <span class="stat-value" id="total-sales">$ 0</span>
-                                <span class="stat-label">Ventas Totales</span>
-                            </div>
-                        </div>
-                        <div class="stat-card accent">
-                            <i class="fas fa-cubes"></i>
-                            <div class="stat-content">
-                                <span class="stat-value" id="avg-order-value">$ 0</span>
-                                <span class="stat-label">Valor Promedio Pedido</span>
-                            </div>
-                        </div>
-                        <div class="stat-card">
-                            <i class="fas fa-cube"></i>
-                            <div class="stat-content">
-                                <span class="stat-value" id="total-products">0</span>
-                                <span class="stat-label">Productos Vendidos</span>
-                            </div>
-                        </div>
-                        <div class="stat-card">
-                            <i class="fas fa-users"></i>
-                            <div class="stat-content">
-                                <span class="stat-value" id="unique-customers">0</span>
-                                <span class="stat-label">Clientes Únicos</span>
-                            </div>
-                        </div>
-                        <div class="stat-card">
-                            <i class="fas fa-user-check"></i>
-                            <div class="stat-content" id="server-available-users-card">
-                                <div class="metric-card small">
-                                    <div class="metric-label">Visitas Totales</div>
-                                    <div class="metric-value" id="server-available-users">0</div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Filters Modal -->
-                <div id="filters-modal" class="filters-modal github-save-modal" role="dialog" aria-modal="true" aria-hidden="true" inert>
-                    <div class="modal-overlay" id="filters-modal-overlay"></div>
-                    <div class="modal-content" role="document">
-                        <div class="modal-header">
-                            <h3>Filtros</h3>
-                            <button class="modal-close" id="filters-modal-close" aria-label="Cerrar filtros">&times;</button>
-                        </div>
-                        <div class="modal-body" style="align-items:flex-start;">
-                            <div class="filters" style="display:flex; width:100%;">
-                                <div class="filter-group">
-                                    <label for="filter-period"><i class="fas fa-calendar-alt"></i> Periodo</label>
-                                    <select id="filter-period" class="select-light">
-                                        <option value="month">Este Mes</option>
-                                        <option value="last-month">Mes Pasado</option>
-                                        <option value="year">Este Año</option>
-                                        <option value="all">Todos</option>
-                                    </select>
-                                </div>
-                                <div class="filter-group">
-                                    <div class="form-label"><i class="fas fa-calendar-week"></i> Rango de Fechas</div>
-                                    <div class="date-range">
-                                        <label for="filter-date-start" class="sr-only">Fecha inicio</label>
-                                        <input type="date" id="filter-date-start" class="input-light">
-                                        <span aria-hidden="true">a</span>
-                                        <label for="filter-date-end" class="sr-only">Fecha fin</label>
-                                        <input type="date" id="filter-date-end" class="input-light">
-                                    </div>
-                                </div>
-                                    <div class="filter-group">
-                                        <label for="filter-country"><i class="fas fa-globe"></i> País</label>
-                                        <select id="filter-country" class="select-light">
-                                            <option value="all">Todos</option>
-                                        </select>
-                                    </div>
-                                    <div class="filter-group">
-                                        <label for="filter-affiliate"><i class="fas fa-link"></i> Afiliado</label>
-                                        <select id="filter-affiliate" class="select-light">
-                                            <option value="all">Todos</option>
-                                        </select>
-                                    </div>
-                                    <div class="filter-group">
-                                        <label for="filter-user-type"><i class="fas fa-user-tag"></i> Tipo de Usuario</label>
-                                        <select id="filter-user-type" class="select-light">
-                                            <option value="all">Todos</option>
-                                            <option value="Único">Único</option>
-                                            <option value="Recurrente">Recurrente</option>
-                                        </select>
-                                    </div>
-                                    <div class="filter-group">
-                                        <label for="filter-browser"><i class="fas fa-desktop"></i> Navegador</label>
-                                        <select id="filter-browser" class="select-light">
-                                            <option value="all">Todos</option>
-                                        </select>
-                                    </div>
-                                    <div class="filter-group">
-                                        <label for="filter-os"><i class="fas fa-hdd"></i> Sistema Operativo</label>
-                                        <select id="filter-os" class="select-light">
-                                            <option value="all">Todos</option>
-                                        </select>
-                                    </div>
-                                    <div class="filter-group">
-                                        <div class="form-label"><i class="fas fa-dollar-sign"></i> Precio Total</div>
-                                        <div style="display:flex;gap:0.5rem;">
-                                            <label for="filter-min-total" class="sr-only">Precio mínimo</label>
-                                            <input type="number" id="filter-min-total" class="input-light" placeholder="Min">
-                                            <label for="filter-max-total" class="sr-only">Precio máximo</label>
-                                            <input type="number" id="filter-max-total" class="input-light" placeholder="Max">
-                                        </div>
-                                    </div>
-                                    <div class="filter-group">
-                                        <label for="filter-has-purchase"><i class="fas fa-shopping-bag"></i> Contiene Pedido</label>
-                                        <select id="filter-has-purchase" class="select-light">
-                                            <option value="all">Todos</option>
-                                            <option value="with">Con Compra</option>
-                                            <option value="without">Sin Compra</option>
-                                        </select>
-                                    </div>
-                            </div>
-                        </div>
-                        <div class="modal-footer">
-                            <button class="btn" id="filters-apply">Aplicar</button>
-                            <button class="btn btn-secondary" id="filters-close">Cerrar</button>
-                        </div>
-                    </div>
-                </div>
-            </header>
-
-            <section class="dashboard-grid">
-                <div class="insights-grid">
-                    <div class="card summary-card">
-                        <h3 class="card-title"><i class="fas fa-chart-bar"></i> Resumen General</h3>
-                        <div class="summary-grid" id="general-summary"></div>
-                    </div>
-
-                    <div class="card full-width" id="globe-card">
-                        <h3 class="card-title"><i class="fas fa-globe"></i> Globo Interactivo de pedidos por pais</h3>
-                            <div class="chart-container">
-                            <div id="globe-container"></div>
-                            <h3 class="HLab">HLab</h3>
-                        </div>
-                    </div>
-
-                    <div class="card daily-card">
-                        <h3 class="card-title"><i class="fas fa-calendar-alt"></i> Resumen Diario</h3>
-                        <div class="summary-grid" id="daily-summary"></div>
-                    </div>
-
-                    <div class="card entry-card">
-                        <h3 class="card-title"><i class="fas fa-clock"></i> Horas de Entrada (Usuarios)</h3>
-                        <div class="card-body" id="entry-hours-card">
-                            <div id="entry-hours-container">
-                                <div class="metric-card">
-                                    <div class="metric-label">Hora Promedio</div>
-                                    <div class="metric-value" id="avg-entry-time">—</div>
-                                </div>
-                                <div id="peak-hours-list">Cargando...</div>
-                                <div>
-                                    <canvas id="entry-hours-canvas"></canvas>
-                                    <div id="entry-hours-legend"></div>
-                                    <div id="entry-hours-histogram"></div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div class="card full-width products-card">
-                        <h3 class="card-title"><i class="fas fa-star"></i> Top Productos</h3>
-                        <div class="chart-container">
-                            <canvas id="products-chart" width="300" height="200"></canvas>
-                        </div>  
-                        <div class="ranking-list compact" id="top-products"></div>
-                    </div>
-
-                    <div class="card full-width sales-card">
-                        <h3 class="card-title"><i class="fas fa-chart-line"></i> Tendencias de Ventas</h3>
-                        <div class="chart-container">
-                            <canvas id="sales-trend-chart" width="300" height="200"></canvas>
-                        </div>
-                    </div>
-                </div>
-
-                
-            </section>
-            <div class="card full-width transactions-card">
-                    <div class="card-header-with-tabs">
-                        <h3 class="card-title"><i class="fas fa-exchange-alt"></i> Transacciones Recientes</h3>
-                        <div class="tabs">
-                            <button class="tab-btn active" data-tab="all">Todos</button>
-                            <button class="tab-btn" data-tab="affiliated">Con Afiliado</button>
-                            <button class="tab-btn" data-tab="direct">Directos</button>
-                        </div>
-                    </div>
-                    <div id="data-list" class="orders-container"></div>
-                </div>
+    <!-- ===================== RESUMEN ===================== -->
+    <section class="view active" id="view-resumen">
+      <header class="view-header">
+        <h2>Resumen</h2>
+        <p>Ventas del mes, ritmo diario y pronóstico de cierre.</p>
+        <div class="header-actions resu-report-actions">
+          <button class="btn btn-ghost" id="resu-export-report" type="button"><i class="fa-solid fa-file-csv"></i> Exportar informe</button>
+          <button class="btn btn-ghost" id="resu-print-report" type="button"><i class="fa-solid fa-print"></i> Imprimir resumen</button>
         </div>
+      </header>
 
-        <!-- Vista Server -->
-        <div id="server-view" class="view-content">
-            <div class="server-header">
-                <h2><i class="fas fa-server"></i> Panel de Control del Servidor</h2>
-                <div class="server-controls">
-                    <div class="auto-refresh-panel">
-                        <label for="auto-refresh-select" class="refresh-label">
-                            <i class="fas fa-sync"></i> Auto-actualizar:
-                        </label>
-                        <select id="auto-refresh-select" class="refresh-select">
-                            <option value="0">Desactivado</option>
-                            <option value="15">Cada 15s</option>
-                            <option value="30">Cada 30s</option>
-                            <option value="60">Cada 60s</option>
-                        </select>
-                        <span class="last-update" id="last-update-time">Actualizado hace poco</span>
-                    </div>
-                    <button class="btn btn-primary" id="refresh-server-btn">
-                        <i class="fas fa-sync-alt"></i> Actualizar
-                    </button>
-                    <button class="btn btn-outline" id="save-orders-btn">
-                        <i class="fas fa-save"></i> Guardar Pedidos
-                    </button>
-                </div>
-            </div>
-
-            <!-- Server Grid con orden de prioridad CSS (nth-child) -->
-            <div class="server-grid">
-                
-                <!-- 1. ESTADO DEL SERVIDOR (Priority: 1 - Full Width) -->
-                <div class="server-card status-card">
-                    <div class="card-header">
-                        <h3><i class="fas fa-heartbeat"></i> Estado del Servidor</h3>
-                    </div>
-                    <div class="status-content" id="server-status-content">
-                        <div class="status-item">
-                            <span class="label">Estado:</span>
-                            <span class="value status-running" id="server-state">Cargando...</span>
-                        </div>
-                        <div class="status-item">
-                            <span class="label">Pedidos Pendientes:</span>
-                            <span class="value" id="pending-orders-count">
-                                <span class="pending-orders-number">0</span>
-                                <span class="pending-orders-indicator" id="pending-orders-indicator"></span>
-                            </span>
-                        </div>
-                        <div class="status-item">
-                            <span class="label">Hora de Inicio:</span>
-                            <span class="value" id="server-start-time">Cargando...</span>
-                        </div>
-                        <div class="status-item">
-                            <span class="label">Tiempo de Actividad:</span>
-                            <span class="value" id="server-uptime">Cargando...</span>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 2. RESUMEN DE ESTADÍSTICAS (Priority: 2) -->
-                <div class="server-card runtime-card">
-                    <div class="card-header">
-                        <h3><i class="fas fa-microchip"></i> Estado del Servidor (Runtime)</h3>
-                    </div>
-                    <div class="runtime-grid" id="server-runtime-stats">
-                        <div class="stat-row">
-                            <span class="label">CPU</span>
-                            <span class="value" id="server-cpu">Cargando...</span>
-                        </div>
-                        <div class="stat-row">
-                            <span class="label">Memoria (heapUsed)</span>
-                            <span class="value" id="server-memory">Cargando...</span>
-                        </div>
-                        <div class="stat-row">
-                            <span class="label">Cores</span>
-                            <span class="value" id="server-cores">Cargando...</span>
-                        </div>
-                        <div class="stat-row">
-                            <span class="label">Muestra CPU (ms)</span>
-                            <span class="value" id="server-sample">100</span>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 4. LOGS DEL SERVIDOR (Priority: 4 - Full Width) -->
-                <div class="server-card full-width">
-                    <div class="card-header">
-                        <h3><i class="fas fa-list"></i> Logs del Servidor</h3>
-                        <button class="btn-icon" id="clear-logs-btn" title="Limpiar logs">
-                            <i class="fas fa-trash"></i>
-                        </button>
-                    </div>
-                    <div class="logs-container" id="server-logs-container">
-                        <p class="no-data">Cargando logs...</p>
-                    </div>
-                </div>
-
-                <!-- 5. ACTIVIDAD DE USUARIOS (Priority: 5 - Full Width) -->
-                <div class="server-card full-width">
-                    <div class="card-header">
-                        <h3><i class="fas fa-user-circle"></i> Actividad de Usuarios</h3>
-                        <div class="filter-logs">
-                            <input type="text" id="filter-users" placeholder="Buscar por IP o país..." class="input-light small">
-                        </div>
-                    </div>
-                    <div class="table-responsive" id="users-activity-container">
-                        <p class="no-data">Cargando usuarios...</p>
-                    </div>
-                </div>
-
-                <!-- 6. FUENTES DE TRÁFICO (Priority: 6) -->
-                <div class="server-card">
-                    <div class="card-header">
-                        <h3><i class="fas fa-globe"></i> Tráfico</h3>
-                    </div>
-                    <div class="traffic-stats" id="traffic-sources">
-                        <p class="no-data">Cargando...</p>
-                    </div>
-                </div>
-
-                <!-- 7. DISTRIBUCIÓN DE PAÍSES (Priority: 7) -->
-                <div class="server-card">
-                    <div class="card-header">
-                        <h3><i class="fas fa-map"></i> Países</h3>
-                    </div>
-                    <div class="countries-stats" id="countries-distribution">
-                        <p class="no-data">Cargando...</p>
-                    </div>
-                </div>
-
-                <!-- 8. NAVEGADORES Y SO (Priority: 8) -->
-                <div class="server-card">
-                    <div class="card-header">
-                        <h3><i class="fas fa-desktop"></i> Navegadores</h3>
-                    </div>
-                    <div class="browser-stats" id="browser-os-stats">
-                        <p class="no-data">Cargando...</p>
-                    </div>
-                </div>
-
-                <!-- 9. ANÁLISIS DE CONVERSIÓN (Priority: 9) -->
-                <div class="server-card">
-                    <div class="card-header">
-                        <h3><i class="fas fa-funnel"></i> Conversión</h3>
-                    </div>
-                    <div class="conversion-stats" id="conversion-analytics">
-                        <p class="no-data">Cargando...</p>
-                    </div>
-                </div>
-
-                <!-- 10. MÉTRICAS DE RENDIMIENTO (Priority: 10 - Full Width) -->
-                <div class="server-card full-width">
-                    <div class="card-header">
-                        <h3><i class="fas fa-tachometer-alt"></i> Rendimiento</h3>
-                    </div>
-                    <div class="performance-metrics" id="performance-metrics">
-                        <p class="no-data">Cargando...</p>
-                    </div>
-                </div>
-
-                <!-- 11. DESEMPEÑO DE AFILIADOS (Priority: 11 - Full Width) -->
-                <div class="server-card full-width">
-                    <div class="card-header">
-                        <h3><i class="fas fa-link"></i> Afiliados</h3>
-                    </div>
-                    <div class="table-responsive" id="affiliate-performance">
-                        <p class="no-data">Cargando...</p>
-                    </div>
-                </div>
-            </div>
+      <div class="stat-grid" id="resu-stat-grid-principal">
+        <div class="stat-card accent">
+          <span class="stat-label">Importe de pedidos</span>
+          <span class="stat-value" id="resu-ventas-mes">—</span>
+          <span class="stat-sub">incluye pedidos pagados y pendientes</span>
         </div>
-
-        <!-- Vista Inventario -->
-        <div id="inventory-view" class="view-content"></div>
-
-
-        <!-- Vista Settings -->
-        <div id="settings-view" class="view-content">
-            <div class="settings-header">
-                <h2><i class="fas fa-cog"></i> Ajustes</h2>
-            </div>
-            
-            <div class="settings-container">
-                <!-- GitHub Integration Section -->
-                <div class="settings-card">
-                    <div class="card-header">
-                        <h3><i class="fab fa-github"></i> Integración con Servidor</h3>
-                        <p class="card-description">Configura tu llave de acceso para guardar datos</p>
-                    </div>
-                    
-                    <div class="settings-form">
-                        <div class="form-group">
-                            <label for="github-token-input">LLave de Acceso</label>
-                            <div class="token-input-wrapper">
-                                <input 
-                                    type="password" 
-                                    id="github-token-input" 
-                                    placeholder="ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-                                    class="input-light token-input"
-                                >
-                                <button class="btn-toggle-token" id="toggle-token-visibility" title="Mostrar/Ocultar token">
-                                    <i class="fas fa-eye"></i>
-                                </button>
-                            </div>
-                            <p class="input-help">
-                                <i class="fas fa-info-circle"></i>
-                                Tu llave se almacena localmente por tanto evita darle el telefono a alguien mas que pueda entrar aqui.
-                            </p>
-                        </div>
-
-                        <div class="form-actions">
-                            <button class="btn btn-primary" id="save-github-settings">
-                                <i class="fas fa-save"></i> Guardar LLave
-                            </button>
-                            <button class="btn btn-secondary" id="test-github-connection">
-                                <i class="fas fa-plug"></i> Probar Conexión
-                            </button>
-                            <button class="btn btn-danger" id="clear-github-settings">
-                                <i class="fas fa-trash"></i> Limpiar LLave
-                            </button>
-                        </div>
-
-                        <div class="settings-status" id="github-settings-status" style="display: none;"></div>
-                    </div>
-                </div>
-
-            </div>
+        <div class="stat-card">
+          <span class="stat-label">Ingresos cobrados</span>
+          <span class="stat-value" id="resu-ingresos-cobrados">—</span>
+          <span class="stat-sub">pedidos con pago confirmado</span>
         </div>
+        <div class="stat-card">
+          <span class="stat-label">Pendiente de cobro</span>
+          <span class="stat-value" id="resu-pendiente-cobro">—</span>
+          <span class="stat-sub" id="resu-pendiente-cobro-sub">—</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Pedidos del mes</span>
+          <span class="stat-value" id="resu-pedidos-mes">—</span>
+          <span class="stat-sub">nuevos + guardados</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Pedidos sin asignar</span>
+          <span class="stat-value" id="resu-pedidos-nuevos">—</span>
+          <span class="stat-sub">pedidos que aún no están en seguimiento</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Seguimiento no pagados</span>
+          <span class="stat-value" id="resu-pedidos-seguimiento">—</span>
+          <span class="stat-sub">pedidos en seguimiento sin pago confirmado</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Ventas ayer</span>
+          <span class="stat-value" id="resu-ventas-ayer">—</span>
+          <span class="stat-sub">total de ventas del día anterior</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Ventas hoy</span>
+          <span class="stat-value" id="resu-ventas-hoy">—</span>
+          <span class="stat-sub">total de ventas de hoy</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Variación vs mes anterior</span>
+          <span class="stat-value" id="resu-crecimiento-mes">—</span>
+          <span class="stat-sub" id="resu-crecimiento-mes-sub">—</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Productos vendidos</span>
+          <span class="stat-value" id="resu-productos-mes">—</span>
+          <span class="stat-sub">unidades este mes</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Usuarios registrados</span>
+          <span class="stat-value" id="resu-usuarios">—</span>
+          <span class="stat-sub" id="resu-usuarios-sub">—</span>
+        </div>
+        <div class="stat-card stat-card-clickable" id="resu-card-bajo-stock" data-goto-inv="bajo">
+          <span class="stat-label">Stock bajo</span>
+          <span class="stat-value" id="resu-stock-bajo">—</span>
+          <span class="stat-sub">productos por agotarse</span>
+        </div>
+        <div class="stat-card stat-card-clickable" id="resu-card-sin-stock" data-goto-inv="sin">
+          <span class="stat-label">Sin stock</span>
+          <span class="stat-value" id="resu-stock-sin">—</span>
+          <span class="stat-sub">productos agotados</span>
+        </div>
+      </div>
+
+      <div class="stat-grid" id="resu-pronostico-grid">
+        <div class="stat-card">
+          <span class="stat-label">Promedio diario este mes</span>
+          <span class="stat-value" id="resu-promedio-diario">—</span>
+          <span class="stat-sub" id="resu-promedio-diario-sub">—</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Promedio diario mes anterior</span>
+          <span class="stat-value" id="resu-promedio-anterior">—</span>
+          <span class="stat-sub" id="resu-promedio-anterior-sub">—</span>
+        </div>
+        <div class="stat-card accent">
+          <span class="stat-label">Pronóstico al cierre del mes</span>
+          <span class="stat-value" id="resu-pronostico-mes">—</span>
+          <span class="stat-sub" id="resu-pronostico-mes-sub">—</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Mes anterior, mismo tramo</span>
+          <span class="stat-value" id="resu-comparacion-mes">—</span>
+          <span class="stat-sub" id="resu-comparacion-mes-sub">—</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Pedidos últimos 7 días</span>
+          <span class="stat-value" id="resu-tendencia-7dias">—</span>
+          <span class="stat-sub" id="resu-tendencia-7dias-sub">—</span>
+        </div>
+      </div>
+      <p class="hint resu-pronostico-contexto" id="resu-pronostico-contexto">—</p>
+
+      <div class="stat-grid" id="resu-clientes-stats">
+        <div class="stat-card">
+          <span class="stat-label">Clientes nuevos este mes</span>
+          <span class="stat-value" id="resu-clientes-nuevos">—</span>
+          <span class="stat-sub">primera compra registrada en este mes</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Clientes recurrentes</span>
+          <span class="stat-value" id="resu-clientes-recurrentes">—</span>
+          <span class="stat-sub" id="resu-clientes-actividad-sub">—</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Recurrentes inactivos 60+ días</span>
+          <span class="stat-value" id="resu-clientes-inactivos">—</span>
+          <span class="stat-sub">clientes identificables sin compra reciente</span>
+        </div>
+      </div>
+
+      <div class="panel-box fullwidth resu-insights-box">
+        <div class="panel-box-head"><h2>Qué requiere atención</h2></div>
+        <div id="resu-insights" class="mini-table"><p class="hint">Cargando…</p></div>
+      </div>
+
+      <div class="panel-grid panel-grid-node-charts">
+        <div class="panel-box">
+          <div class="panel-box-head">
+            <h2>Pipeline de pedidos</h2>
+            <span class="hint" style="margin:0;">Nuevos → Seguimiento → Completados</span>
+          </div>
+          <div class="node-chart" id="resu-pipeline-chart">Cargando…</div>
+        </div>
+        <div class="panel-box">
+          <div class="panel-box-head">
+            <h2>Estado del inventario</h2>
+            <span class="hint" style="margin:0;">Disponible → Stock bajo → Sin stock</span>
+          </div>
+          <div class="node-chart" id="resu-inventario-chart">Cargando…</div>
+        </div>
+      </div>
+
+      <div class="panel-box fullwidth resu-filtro-box">
+        <div class="panel-box-head">
+          <h2>Filtrar por rango de fechas</h2>
+        </div>
+        <div class="resu-filtro-row">
+          <div class="seg-tabs" id="resu-rango-presets">
+            <button class="seg-tab active" data-rango="hoy">Hoy</button>
+            <button class="seg-tab" data-rango="ayer">Ayer</button>
+            <button class="seg-tab" data-rango="7dias">Últimos 7 días</button>
+            <button class="seg-tab" data-rango="30dias">Últimos 30 días</button>
+            <button class="seg-tab" data-rango="mes">Este mes</button>
+            <button class="seg-tab" data-rango="mesanterior">Mes anterior</button>
+          </div>
+          <div class="resu-filtro-custom">
+            <label>Desde <input type="date" id="resu-desde"></label>
+            <label>Hasta <input type="date" id="resu-hasta"></label>
+            <button class="btn btn-ghost btn-small" id="resu-rango-aplicar">Aplicar rango</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="stat-grid" id="resu-rango-stats">
+        <div class="stat-card accent">
+          <span class="stat-label">Ventas en el rango</span>
+          <span class="stat-value" id="resu-rango-ventas">—</span>
+          <span class="stat-sub" id="resu-rango-label">—</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Pedidos en el rango</span>
+          <span class="stat-value" id="resu-rango-pedidos">—</span>
+          <span class="stat-sub">pedidos con fecha dentro del rango</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Productos vendidos</span>
+          <span class="stat-value" id="resu-rango-productos">—</span>
+          <span class="stat-sub">unidades dentro del rango</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Ticket promedio</span>
+          <span class="stat-value" id="resu-rango-ticket">—</span>
+          <span class="stat-sub">venta promedio por pedido</span>
+        </div>
+      </div>
+
+      <div class="panel-grid">
+        <div class="panel-box">
+          <div class="panel-box-head">
+            <h2>Pedidos recientes</h2>
+          </div>
+          <div id="resu-recientes" class="mini-table">Cargando…</div>
+        </div>
+        <div class="panel-box">
+          <div class="panel-box-head">
+            <h2>Orígenes de tráfico</h2>
+          </div>
+          <div id="resu-origenes" class="mini-table">Cargando…</div>
+        </div>
+      </div>
+
+      <div class="panel-box fullwidth">
+        <div class="panel-box-head">
+          <h2>Flujo de origen a venta</h2>
+          <span class="hint" style="margin:0;">Volúmenes agregados; los pedidos no están vinculados a un origen</span>
+        </div>
+        <div class="flow-chart" id="resu-flow-chart">Cargando…</div>
+      </div>
+
+      <div class="panel-grid">
+        <div class="panel-box">
+          <div class="panel-box-head">
+            <h2>Productos más vendidos</h2>
+          </div>
+          <div id="resu-top-productos" class="mini-table">Cargando…</div>
+        </div>
+        <div class="panel-box">
+          <div class="panel-box-head">
+            <h2>Stock bajo / agotado</h2>
+          </div>
+          <div id="resu-stock-lista" class="mini-table">Cargando…</div>
+        </div>
+      </div>
+
+      <div class="panel-box fullwidth">
+        <div class="panel-box-head">
+          <h2>Ventas del mes por día</h2>
+        </div>
+        <div class="sales-chart" id="resu-ventas-mes-chart">Cargando…</div>
+      </div>
+
+      <div class="panel-box fullwidth">
+        <div class="panel-box-head">
+          <h2>Horas buenas de entrada de usuarios</h2>
+          <span class="hint" style="margin:0;">Cantidad de visitas por hora del día, según el registro de usuarios</span>
+        </div>
+        <div class="sales-chart" id="resu-horas-chart">Cargando…</div>
+      </div>
+    </section>
+
+    <!-- ===================== CONFIG ===================== -->
+    <section class="view" id="view-config">
+      <header class="view-header">
+        <h2>Conexión al backend</h2>
+        <p>Cambia la URL de tu servidor si es necesario. Las imágenes usan el Cloud de Cloudinary fijo del negocio.</p>
+      </header>
+
+      <div class="form-card">
+        <label>URL del backend
+          <input type="text" id="cfg-api-url" placeholder="https://tu-backend.onrender.com">
+        </label>
+        <div class="form-actions">
+          <button class="btn btn-primary" id="cfg-save">Guardar y probar conexión</button>
+        </div>
+        <p class="hint" id="cfg-result"></p>
+      </div>
+
+      <div class="form-card">
+        <div class="modal-section-title">Descargar bases de datos RTDB</div>
+        <p class="hint">Exporta el contenido completo de cada base de datos en formato JSON. Los archivos pueden incluir datos personales; guárdalos de forma segura.</p>
+        <div class="form-actions">
+          <button type="button" class="btn btn-secondary" data-rtdb-export="principal">Descargar RTDB principal</button>
+          <button type="button" class="btn btn-secondary" data-rtdb-export="secundaria">Descargar RTDB secundaria</button>
+        </div>
+        <p class="hint" id="rtdb-export-result" aria-live="polite"></p>
+      </div>
+
+      <div class="modal-section-title"><span class="dot"></span>Uso de Cloudinary</div>
+      <div class="stat-grid" id="cld-usage-grid">
+        <div class="stat-card accent">
+          <span class="stat-label">Créditos usados</span>
+          <span class="stat-value" id="cld-credits">—</span>
+          <span class="stat-sub" id="cld-credits-sub">—</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Almacenamiento</span>
+          <span class="stat-value" id="cld-storage">—</span>
+          <span class="stat-sub">espacio ocupado en Cloudinary</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Ancho de banda</span>
+          <span class="stat-value" id="cld-bandwidth">—</span>
+          <span class="stat-sub">transferido este ciclo</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Transformaciones</span>
+          <span class="stat-value" id="cld-transformations">—</span>
+          <span class="stat-sub">ejecutadas este ciclo</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Recursos almacenados</span>
+          <span class="stat-value" id="cld-resources">—</span>
+          <span class="stat-sub">imágenes en la cuenta</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Peticiones</span>
+          <span class="stat-value" id="cld-requests">—</span>
+          <span class="stat-sub">requests este ciclo</span>
+        </div>
+      </div>
+      <p class="hint" id="cld-usage-hint"></p>
+
+    </section>
+
+    <!-- ===================== NOTIFICACIONES ===================== -->
+    <section class="view" id="view-notificaciones">
+      <header class="view-header">
+        <h2>Notificaciones</h2>
+        <p>Selecciona un icono FontAwesome y edita el texto que verá el cliente en el banner.</p>
+      </header>
+      <div class="form-card">
+        <div class="modal-section-title">Icono de notificación</div>
+        <div class="icon-picker" id="notif-iconpicker"></div>
+        <p class="hint" style="margin-top:-8px; margin-bottom:16px;">Haz clic en un icono para seleccionarlo; el panel activo se resalta con color y la vista previa se actualiza abajo.</p>
+        <label>Clase de icono
+          <div class="icon-input-row">
+            <input type="text" id="notif-icono" placeholder="fas fa-bell">
+            <span class="icon-input-preview" id="notif-icon-preview"><i class="fas fa-bell"></i></span>
+          </div>
+        </label>
+        <div class="modal-section-title">Contenido del banner</div>
+        <label>Título
+          <input type="text" id="notif-titulo" placeholder="Nueva oferta disponible">
+        </label>
+        <label>Subtítulo
+          <input type="text" id="notif-subtitulo" placeholder="Solo por tiempo limitado">
+        </label>
+        <label>Mensaje
+          <textarea id="notif-mensaje" rows="3" placeholder="Agrega aquí el texto que verán los clientes..."></textarea>
+        </label>
+        <label>Tipo
+          <select id="notif-tipo">
+            <option value="info">Información</option>
+            <option value="success">Éxito</option>
+            <option value="warning">Advertencia</option>
+            <option value="danger">Error</option>
+          </select>
+        </label>
+        <div class="form-actions">
+          <button class="btn btn-primary" id="notif-save" type="button">Guardar notificación</button>
+          <button class="btn btn-ghost" id="notif-load" type="button">Recargar actual</button>
+        </div>
+        <p class="hint" id="notif-hint">Carga la notificación actual del backend y edítala aquí.</p>
+      </div>
+    </section>
+
+    <!-- ===================== INVENTARIO ===================== -->
+    <section class="view" id="view-inventario">
+      <header class="view-header">
+        <h2>Inventario</h2>
+        <p>Productos del catálogo: precio, stock, ofertas e imágenes.</p>
+        <div class="header-actions">
+          <div class="inv-search-row">
+            <input type="search" id="inv-search" class="search" placeholder="Buscar producto...">
+            <label class="umbral-field">Umbral stock bajo
+              <input type="number" id="inv-umbral" min="0" step="1">
+            </label>
+          </div>
+          <button class="btn btn-ghost" id="inv-check-ventas-btn"><i class="fa-solid fa-chart-line"></i> Ventas por producto</button>
+          <button class="btn btn-ghost" id="inv-export-csv" type="button"><i class="fa-solid fa-file-csv"></i> Exportar CSV</button>
+          <button class="btn btn-primary" id="inv-new">+ Nuevo producto</button>
+        </div>
+        <div class="seg-tabs" id="inv-tabs">
+          <button class="seg-tab active" data-itab="todos">Todos <span class="seg-tab-count" id="inv-count-todos">0</span></button>
+          <button class="seg-tab" data-itab="bajo">Stock bajo <span class="seg-tab-count" id="inv-count-bajo">0</span></button>
+          <button class="seg-tab" data-itab="sin">Sin stock <span class="seg-tab-count" id="inv-count-sin">0</span></button>
+          <button class="seg-tab" data-itab="control">Con control <span class="seg-tab-count" id="inv-count-control">0</span></button>
+        </div>
+      </header>
+      <div class="stat-chip-row" id="inv-stats"></div>
+      <details class="panel-box fullwidth inventory-insights-box">
+        <summary class="panel-box-head">
+          <h2>Reposición y rotación</h2>
+          <span class="inventory-insights-count" id="inv-insights-count">Calculando…</span>
+          <i class="fa-solid fa-chevron-down inventory-insights-chevron" aria-hidden="true"></i>
+        </summary>
+        <p class="hint inventory-insights-hint">Basado en unidades pedidas durante los últimos 30 días</p>
+        <div id="inv-insights" class="mini-table"><p class="hint">Cargando análisis de pedidos…</p></div>
+      </details>
+      <div class="inv-list-toolbar">
+        <label>Ordenar por
+          <select id="inv-sort">
+            <option value="urgencia">Urgencia de reposición</option>
+            <option value="stock_asc">Menor stock</option>
+            <option value="stock_desc">Mayor stock</option>
+            <option value="ventas_desc">Más pedidos (30 días)</option>
+            <option value="nombre">Nombre A-Z</option>
+          </select>
+        </label>
+        <div class="inv-view-toggle" role="group" aria-label="Vista del inventario">
+          <button class="icon-btn" type="button" data-inv-view="tarjetas" title="Vista de tarjetas" aria-label="Vista de tarjetas"><i class="fa-solid fa-grip"></i></button>
+          <button class="icon-btn" type="button" data-inv-view="tabla" title="Vista de tabla" aria-label="Vista de tabla"><i class="fa-solid fa-table-list"></i></button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <div class="inventory-grid" id="inv-grid"></div>
+        <p class="empty" id="inv-empty" hidden>No hay productos todavía.</p>
+      </div>
+    </section>
+
+    <!-- ===================== PACKS ===================== -->
+    <section class="view" id="view-packs">
+      <header class="view-header">
+        <h2>Packs / Combos</h2>
+        <p>Combos armados a partir de productos del inventario.</p>
+        <div class="header-actions">
+          <input type="search" id="pack-search" class="search" placeholder="Buscar pack...">
+          <button class="btn btn-primary" id="pack-new">+ Nuevo pack</button>
+        </div>
+        <div class="seg-tabs" id="pack-tabs">
+          <button class="seg-tab active" data-ptab="todos">Todos <span class="seg-tab-count" id="pack-count-todos">0</span></button>
+          <button class="seg-tab" data-ptab="disponibles">Disponibles <span class="seg-tab-count" id="pack-count-disponibles">0</span></button>
+          <button class="seg-tab" data-ptab="oferta">En oferta <span class="seg-tab-count" id="pack-count-oferta">0</span></button>
+        </div>
+      </header>
+      <div class="table-wrap">
+        <div class="pack-grid" id="pack-grid"></div>
+        <p class="empty" id="pack-empty" hidden>No hay packs todavía.</p>
+      </div>
+    </section>
+
+    <!-- ===================== PEDIDOS (Nuevos + Guardados) ===================== -->
+    <section class="view" id="view-pedidos">
+      <header class="view-header">
+        <h2>Pedidos</h2>
+        <p>Pedidos nuevos recién recibidos y pedidos guardados en seguimiento. Al guardar un pedido nuevo pasa automáticamente al panel de seguimiento, donde se registra el estado y la evolución del pedido.</p>
+        <div class="header-actions">
+          <input type="search" id="pedidos-search" class="search" placeholder="Buscar por comprador, teléfono, orden o total (ej. 77.20)...">
+          <button class="btn btn-ghost" id="pedidos-refresh">↻ Actualizar</button>
+          <button class="btn btn-ghost" id="pedidos-export-csv">⬇ Exportar CSV</button>
+        </div>
+        <div id="ped-filtro-rango">
+          <div class="resu-filtro-row">
+            <div class="seg-tabs" id="pedidos-filtro-fecha">
+              <button class="seg-tab active" data-pfiltro="todos">Todos</button>
+              <button class="seg-tab" data-pfiltro="hoy">Hoy</button>
+              <button class="seg-tab" data-pfiltro="ayer">Ayer</button>
+              <button class="seg-tab" data-pfiltro="semana">Esta semana</button>
+              <button class="seg-tab" data-pfiltro="mes">Este mes</button>
+            </div>
+            <div class="resu-filtro-custom">
+              <label>Desde <input type="date" id="ped-fecha-desde"></label>
+              <label>Hasta <input type="date" id="ped-fecha-hasta"></label>
+              <button class="btn btn-ghost btn-small" id="ped-fecha-aplicar" type="button">Aplicar rango</button>
+              <button class="btn btn-ghost btn-small" id="ped-fecha-quitar" type="button" hidden>Quitar</button>
+            </div>
+          </div>
+          <p class="hint" id="ped-filtro-resumen"></p>
+        </div>
+        <div class="seg-tabs" id="pedidos-tabs">
+          <button class="seg-tab active" data-ptab="nuevos">Nuevos <span class="seg-tab-count" id="tab-count-nuevos">0</span></button>
+          <button class="seg-tab" data-ptab="guardados">Guardados <span class="seg-tab-count" id="tab-count-guardados">0</span></button>
+          <button class="seg-tab" data-ptab="seguimiento">Seguimiento <span class="seg-tab-count" id="tab-count-seguimiento">0</span></button>
+        </div>
+      </header>
+
+      <!-- Panel: Pedidos nuevos -->
+      <div class="pedidos-panel active" id="pedidos-panel-nuevos">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Fecha</th><th>Orden</th><th>Comprador</th><th>Teléfono</th><th>Dirección</th><th>Total</th><th>Fecha entrega</th><th>Cliente</th><th></th>
+              </tr>
+            </thead>
+            <tbody id="nuevos-tbody"></tbody>
+          </table>
+          <p class="empty" id="nuevos-empty" hidden>No hay pedidos nuevos.</p>
+        </div>
+      </div>
+
+      <!-- Panel: Pedidos guardados (solo lectura) -->
+      <div class="pedidos-panel" id="pedidos-panel-guardados">
+        <div class="view-subheader">Pedidos que ya salieron de Nuevos. Solo datos, sin edición de estados.</div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Fecha asignación</th><th>Orden</th><th>Comprador</th><th>Teléfono</th><th>Total</th><th>Fecha entrega</th><th>Ya Compró</th><th>Estado</th>
+              </tr>
+            </thead>
+            <tbody id="guardados-tbody"></tbody>
+          </table>
+          <p class="empty" id="guardados-empty" hidden>No hay pedidos guardados.</p>
+        </div>
+      </div>
+
+      <!-- Panel: Seguimiento editable -->
+      <div class="pedidos-panel" id="pedidos-panel-seguimiento">
+        <div class="seg-tabs nested" id="seg-tabs">
+          <button class="seg-tab active" data-tab="proceso">En proceso <span class="seg-tab-count" id="seg-count-proceso">0</span></button>
+          <button class="seg-tab" data-tab="completado">Completados <span class="seg-tab-count" id="seg-count-completado">0</span></button>
+        </div>
+        <div class="view-subheader">Pedidos en seguimiento: aquí se controla el estado y la evolución del pedido.</div>
+        <div class="seg-tabs" id="seg-filtro-entrega">
+          <button class="seg-tab active" data-entrega="todos">Todos</button>
+          <button class="seg-tab" data-entrega="hoy">Hoy</button>
+          <button class="seg-tab" data-entrega="atrasados">Atrasados</button>
+          <button class="seg-tab" data-entrega="semana">Esta semana</button>
+          <button class="seg-tab" data-entrega="proximos7">Próximos 7 días</button>
+          <button class="seg-tab" data-entrega="mes">Este mes</button>
+          <button class="seg-tab" data-entrega="sin_fecha">Sin fecha</button>
+        </div>
+        <div class="resu-filtro-custom" style="grid-template-columns:auto;max-width:220px;margin:8px 0 4px;">
+          <label>Ordenar por
+            <select id="seg-sort">
+              <option value="fecha_desc">Más reciente primero</option>
+              <option value="fecha_asc">Más antiguo primero</option>
+              <option value="entrega_asc">Fecha entrega ↑</option>
+              <option value="entrega_desc">Fecha entrega ↓</option>
+              <option value="total_desc">Mayor total</option>
+              <option value="total_asc">Menor total</option>
+            </select>
+          </label>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Fecha asignación</th><th>Orden</th><th>Comprador</th><th>Teléfono</th><th>Total</th><th>Ya compró</th><th>Fecha entrega</th><th>Estados</th><th>Marcador</th><th></th>
+              </tr>
+            </thead>
+            <tbody id="seg-tbody"></tbody>
+          </table>
+          <p class="empty" id="seg-empty" hidden>No hay pedidos acá.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== USUARIOS / ESTADÍSTICAS ===================== -->
+    <section class="view" id="view-usuarios">
+      <header class="view-header">
+        <h2>Registro de usuarios</h2>
+        <p>Visitas de la tienda y clientes que han comprado, según los pedidos registrados.</p>
+      </header>
+
+      <div class="seg-tabs" id="usr-tabs">
+        <button class="seg-tab active" data-utab="visitas">Visitas</button>
+        <button class="seg-tab" data-utab="clientes">Clientes</button>
+      </div>
+
+      <div class="tab-panel active" id="usr-panel-visitas">
+        <div class="header-actions" style="margin-bottom:14px;">
+          <input type="search" id="usr-search" class="search" placeholder="Buscar usuario, IP, país, navegador...">
+          <button class="btn btn-ghost" id="usr-refresh">↻ Actualizar</button>
+          <button class="btn btn-danger" id="usr-clear-stats" type="button"><i class="fa-solid fa-eraser"></i> Limpiar estadísticas</button>
+        </div>
+        <p class="hint warn" style="margin-bottom:14px;">Limpiar estadísticas borra únicamente los registros de visitas guardados en /estadisticas de la base de datos secundaria. No afecta pedidos, clientes, inventario, packs ni los ingresos ya registrados.</p>
+        <div class="usr-panel">
+          <div class="usr-summary-grid">
+            <div class="usr-stat-card">
+              <span>Total</span>
+              <strong id="usr-total-count">0</strong>
+            </div>
+            <div class="usr-stat-card">
+              <span>Recurr.</span>
+              <strong id="usr-recurrent-count">0</strong>
+            </div>
+            <div class="usr-stat-card">
+              <span>Únicos</span>
+              <strong id="usr-unique-count">0</strong>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <div class="usr-summary" id="usr-summary">Mostrando 0 registros.</div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Fecha/Hora</th><th>IP</th><th>País</th><th>Tipo</th><th>Origen</th><th>Navegador</th><th>SO</th>
+                </tr>
+              </thead>
+              <tbody id="usr-tbody"></tbody>
+            </table>
+            <p class="empty" id="usr-empty" hidden>No hay registros todavía.</p>
+            <div class="usr-actions">
+              <button class="btn btn-ghost" id="usr-load-more" type="button">Cargar más</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tab-panel" id="usr-panel-clientes">
+        <div class="header-actions" style="margin-bottom:14px;">
+          <input type="search" id="cli-search" class="search" placeholder="Buscar cliente por nombre, teléfono o correo...">
+          <button class="btn btn-ghost" id="cli-refresh">↻ Actualizar</button>
+          <button class="btn btn-ghost" id="cli-export-csv">⬇ Exportar CSV</button>
+        </div>
+        <div class="usr-panel">
+          <div class="usr-summary-grid">
+            <div class="usr-stat-card">
+              <span>Clientes</span>
+              <strong id="cli-total-count">0</strong>
+            </div>
+            <div class="usr-stat-card">
+              <span>Pedidos</span>
+              <strong id="cli-pedidos-total">0</strong>
+            </div>
+            <div class="usr-stat-card">
+              <span>Ingresos</span>
+              <strong id="cli-ingresos-total">$0.00</strong>
+            </div>
+          </div>
+          <div class="table-wrap cli-table-wrap">
+            <div class="usr-summary" id="cli-summary">Mostrando 0 clientes.</div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Cliente</th><th>Teléfono</th><th>Correo</th><th>Pedidos</th><th>Total gastado</th><th>Última compra</th><th>Acciones</th>
+                </tr>
+              </thead>
+              <tbody id="cli-tbody"></tbody>
+            </table>
+            <p class="empty" id="cli-empty" hidden>Todavía no hay clientes con pedidos registrados.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
     </main>
-    </div>
+  </div>
+</div>
 
-    <footer class="app-footer">
-        <div class="footer-content">
-            <span>&copy; 2026 Casa Fresca Dashboard. Todos los derechos reservados HLab</span>
-            <span class="footer-version">Versión 1.2.1</span>
-            <div id="reloj">
-                
-            </div>
+<!-- ===================== MODAL PRODUCTO ===================== -->
+<div class="modal-backdrop" id="modal-producto">
+  <div class="modal">
+    <header class="modal-header">
+      <h3 id="prod-modal-title">Nuevo producto</h3>
+      <button class="modal-close" data-close="modal-producto">✕</button>
+    </header>
+    <div class="modal-body">
+      <input type="hidden" id="prod-id">
+
+      <div class="modal-section">
+        <div class="modal-section-title"><span class="dot"></span> Información general</div>
+        <div class="grid-2">
+          <label>Nombre
+            <input type="text" id="prod-nombre" placeholder="Ej. Tamal de maíz">
+          </label>
+          <label>Categoría
+            <select id="prod-categoria"></select>
+          </label>
         </div>
+        <label>Descripción
+          <textarea id="prod-descripcion" rows="3" placeholder="Detalles visibles para el cliente..."></textarea>
+        </label>
+      </div>
+
+      <div class="modal-section">
+        <div class="modal-section-title"><span class="dot"></span> Precio y stock</div>
+        <div class="grid-2">
+          <label>Precio normal
+            <input type="number" step="0.01" id="prod-precio" placeholder="0.00">
+          </label>
+          <label>Stock disponible
+            <input type="number" id="prod-stock" placeholder="0">
+          </label>
+        </div>
+        <label class="check"><input type="checkbox" id="prod-aplicar-stock"> Controlar stock de este producto (descuenta unidades automáticamente al recibir pedidos y permite ver bajo stock / sin stock)</label>
+        <label>Cantidad mínima de compra
+          <input type="number" min="1" step="1" id="prod-cantidad-minima" placeholder="1">
+        </label>
+        <p class="hint">El cliente no podrá añadir menos de esta cantidad al carrito. Déjalo en 1 para no exigir mínimo.</p>
+        <div class="grid-2">
+          <label>Plazo de reposición (días)
+            <input type="number" min="0" max="365" step="1" id="prod-lead-days" placeholder="0">
+          </label>
+          <label>Reserva adicional (días)
+            <input type="number" min="0" max="365" step="1" id="prod-safety-days" placeholder="0">
+          </label>
+        </div>
+        <p class="hint">Se usa con la demanda reciente para recomendar cuándo y cuánto reponer. Déjalo en 0 si aún no tienes ese dato.</p>
+      </div>
+
+      <div class="modal-section">
+        <div class="modal-section-title"><span class="dot"></span> Oferta y descuento</div>
+        <label class="check"><input type="checkbox" id="prod-oferta"> Este producto está en oferta</label>
+        <div class="oferta-box" id="prod-oferta-box" hidden>
+          <div class="grid-2">
+            <label>Precio con descuento
+              <input type="number" step="0.01" id="prod-precio-oferta" placeholder="0.00">
+            </label>
+            <label>Descuento calculado
+              <input type="text" id="prod-descuento-view" placeholder="—" disabled>
+            </label>
+          </div>
+          <p class="hint" id="prod-oferta-info">Ingresa el precio final y el porcentaje se calcula solo.</p>
+          <input type="hidden" id="prod-descuento" value="0">
+        </div>
+      </div>
+
+      <div class="modal-section">
+        <div class="modal-section-title"><span class="dot"></span> Nota especial (info)</div>
+        <label>Nota para este producto (ej. tiempo de anticipación, oferta especial...)
+          <textarea id="prod-info" rows="3" placeholder="Ej. Para este producto debe hacerse el pedido con 2 días de anticipación."></textarea>
+        </label>
+        <p class="hint">Déjalo vacío para no mostrar ninguna nota. Esta nota se guarda por separado y no forma parte de los datos del producto.</p>
+      </div>
+
+      <div class="modal-section">
+        <div class="modal-section-title"><span class="dot"></span> Visibilidad</div>
+        <div class="grid-2 checks">
+          <label class="check"><input type="checkbox" id="prod-activo" checked> Disponible (visible en la tienda)</label>
+          <label class="check"><input type="checkbox" id="prod-mas-vendido"> Marcar como "Más vendido"</label>
+        </div>
+        <p class="hint" id="prod-activo-hint" hidden></p>
+      </div>
+
+      <div class="modal-section">
+        <div class="images-section">
+          <div class="images-section-head">
+            <span class="modal-section-title" style="margin:0;"><span class="dot"></span> Imágenes</span>
+            <label class="btn btn-ghost btn-small file-btn">
+              + Añadir imagen
+              <input type="file" id="prod-file-input" accept="image/*" multiple hidden>
+            </label>
+          </div>
+          <div class="image-grid" id="prod-image-grid"></div>
+          <p class="hint" id="prod-image-hint"></p>
+        </div>
+      </div>
+    </div>
+    <footer class="modal-footer">
+      <button class="btn btn-danger" id="prod-delete" hidden>Eliminar producto</button>
+      <div class="spacer"></div>
+      <button class="btn btn-ghost" data-close="modal-producto">Cancelar</button>
+      <button class="btn btn-primary" id="prod-save">Guardar</button>
     </footer>
+  </div>
+</div>
 
-    <!-- Modal de Guardado en GitHub -->
-    <div class="github-save-modal" id="github-save-modal">
-        <div class="modal-overlay" id="modal-overlay"></div>
-        <div class="modal-content">
-            <div class="modal-header">
-                <h3 id="modal-title">Guardando Datos...</h3>
-                <button class="modal-close" id="modal-close-btn" aria-label="Cerrar">
-                    <i class="fas fa-times"></i>
-                </button>
-            </div>
-            <div class="modal-body">
-                <div class="modal-icon" id="modal-icon">
-                    <i class="fas fa-spinner fa-spin"></i>
-                </div>
-                <div class="modal-message" id="modal-message">
-                    <p class="status-text" id="status-text">Conectando con GitHub...</p>
-                    <p class="detail-text" id="detail-text">Por favor espera</p>
-                </div>
-                <div class="modal-progress" id="modal-progress" style="display: none;">
-                    <div class="progress-bar">
-                        <div class="progress-fill" id="progress-fill"></div>
-                    </div>
-                    <p class="progress-text" id="progress-text">0%</p>
-                </div>
-            </div>
-            <div class="modal-footer" id="modal-footer">
-                <button class="btn btn-primary" id="modal-retry-btn" style="display: none;">
-                    <i class="fas fa-redo"></i> Reintentar
-                </button>
-                <button class="btn btn-secondary" id="modal-close-final-btn" style="display: none;">
-                    Cerrar
-                </button>
-            </div>
+<!-- ===================== MODAL PACK ===================== -->
+<div class="modal-backdrop" id="modal-pack">
+  <div class="modal">
+    <header class="modal-header">
+      <h3 id="pack-modal-title">Nuevo pack</h3>
+      <button class="modal-close" data-close="modal-pack">✕</button>
+    </header>
+    <div class="modal-body">
+      <input type="hidden" id="pack-id">
+
+      <div class="modal-section">
+        <div class="modal-section-title"><span class="dot"></span> Información general</div>
+        <div class="grid-2">
+          <label>Nombre
+            <input type="text" id="pack-nombre" placeholder="Ej. Combo familiar">
+          </label>
+          <label>Categoría
+            <div class="fixed-field">Pack</div>
+            <input type="hidden" id="pack-categoria" value="Pack">
+          </label>
         </div>
-    </div>
+        <label>Descripción
+          <textarea id="pack-descripcion" rows="3" placeholder="Detalles visibles para el cliente..."></textarea>
+        </label>
+        <label>Características (una por línea)
+          <textarea id="pack-caracteristicas" rows="4" placeholder="- Tamales&#10;- Ensalada de Tomate y Col&#10;- Congris"></textarea>
+        </label>
+      </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
-    <script type="module" src="Js/app.js" defer></script>
-    <script type="module" src="Js/Modules/Tools/server-panel.js" defer></script>
-    <script type="module" src="Js/UI/globe.js" defer></script>
+      <div class="modal-section">
+        <div class="modal-section-title"><span class="dot"></span> Precio</div>
+        <label>Precio normal
+          <input type="number" step="0.01" id="pack-precio" placeholder="0.00">
+        </label>
+      </div>
+
+      <div class="modal-section">
+        <div class="modal-section-title"><span class="dot"></span> Oferta y descuento</div>
+        <label class="check"><input type="checkbox" id="pack-oferta"> Este pack está en oferta</label>
+        <div class="oferta-box" id="pack-oferta-box" hidden>
+          <div class="grid-2">
+            <label>Precio con descuento
+              <input type="number" step="0.01" id="pack-precio-oferta" placeholder="0.00">
+            </label>
+            <label>Descuento calculado
+              <input type="text" id="pack-descuento-view" placeholder="—" disabled>
+            </label>
+          </div>
+          <p class="hint" id="pack-oferta-info">Ingresa el precio final y el porcentaje se calcula solo.</p>
+          <input type="hidden" id="pack-descuento" value="0">
+        </div>
+      </div>
+
+      <div class="modal-section">
+        <div class="modal-section-title"><span class="dot"></span> Visibilidad y etiquetas</div>
+        <div class="grid-3 checks">
+          <label class="check"><input type="checkbox" id="pack-disponible" checked> Disponible</label>
+          <label class="check"><input type="checkbox" id="pack-top"> Destacado (top)</label>
+          <label class="check"><input type="checkbox" id="pack-nuevo"> Nuevo</label>
+        </div>
+      </div>
+
+      <div class="modal-section">
+        <div class="images-section">
+          <div class="images-section-head">
+            <span class="modal-section-title" style="margin:0;"><span class="dot"></span> Imágenes</span>
+            <label class="btn btn-ghost btn-small file-btn">
+              + Añadir imagen
+              <input type="file" id="pack-file-input" accept="image/*" multiple hidden>
+            </label>
+          </div>
+          <div class="image-grid" id="pack-image-grid"></div>
+          <p class="hint" id="pack-image-hint"></p>
+        </div>
+      </div>
+    </div>
+    <footer class="modal-footer">
+      <button class="btn btn-danger" id="pack-delete" hidden>Eliminar pack</button>
+      <div class="spacer"></div>
+      <button class="btn btn-ghost" data-close="modal-pack">Cancelar</button>
+      <button class="btn btn-primary" id="pack-save">Guardar</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ===================== MODAL DETALLE DE IMAGEN ===================== -->
+<div class="modal-backdrop" id="modal-image-detail">
+  <div class="modal modal-image-detail">
+    <header class="modal-header">
+      <h3>Detalle de imagen<span class="image-detail-count" id="img-detail-count"></span></h3>
+      <button class="modal-close" data-close="modal-image-detail">✕</button>
+    </header>
+    <div class="modal-body image-detail-body">
+      <div class="image-detail-preview">
+        <img id="img-detail-preview" src="" alt="Detalle de imagen">
+      </div>
+      <div class="image-detail-thumbs" id="img-detail-thumbs" hidden></div>
+      <div class="image-detail-grid">
+        <div><strong>Nombre / public_id</strong><span id="img-detail-name">—</span></div>
+        <div><strong>Cloudinary</strong><span id="img-detail-cloud">—</span></div>
+        <div><strong>Formato real</strong><span id="img-detail-format">—</span></div>
+        <div><strong>Tamaño</strong><span id="img-detail-size">—</span></div>
+        <div><strong>Dimensiones</strong><span id="img-detail-dimensions">—</span></div>
+        <div class="image-detail-url"><strong>URL</strong><a id="img-detail-url" href="#" target="_blank" rel="noopener noreferrer">—</a></div>
+      </div>
+    </div>
+    <footer class="modal-footer">
+      <button class="btn btn-ghost" data-close="modal-image-detail">Cerrar</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ===================== MODAL DETALLE PEDIDO ===================== -->
+<div class="modal-backdrop" id="modal-pedido">
+  <div class="modal">
+    <header class="modal-header">
+      <h3>Detalle del pedido</h3>
+      <button class="modal-close" data-close="modal-pedido">✕</button>
+    </header>
+    <div class="modal-body" id="pedido-detalle-body"></div>
+    <footer class="modal-footer">
+      <button class="btn btn-primary" id="pedido-descargar-factura" type="button"><i class="fa-solid fa-file-arrow-down" aria-hidden="true"></i> Descargar factura</button>
+      <button class="btn btn-ghost" data-close="modal-pedido">Cerrar</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ===================== MODAL DETALLE CLIENTE ===================== -->
+<div class="modal-backdrop" id="modal-cliente">
+  <div class="modal">
+    <header class="modal-header">
+      <h3>Detalle del cliente</h3>
+      <button class="modal-close" data-close="modal-cliente">✕</button>
+    </header>
+    <div class="modal-body" id="cliente-detalle-body"></div>
+    <footer class="modal-footer">
+      <button class="btn btn-ghost" data-close="modal-cliente">Cerrar</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ===================== MODAL VENTAS POR PRODUCTO ===================== -->
+<div class="modal-backdrop" id="modal-stock-check">
+  <div class="modal">
+    <header class="modal-header">
+      <h3>Ventas por producto</h3>
+      <button class="modal-close" data-close="modal-stock-check">✕</button>
+    </header>
+    <div class="modal-body">
+
+      <div class="modal-section">
+        <div class="modal-section-title"><span class="dot"></span> Producto</div>
+        <div class="autocomplete-wrap">
+          <input type="search" id="stockchk-search" class="search" placeholder="Buscar producto (con o sin tildes)..." autocomplete="off">
+          <div class="autocomplete-list" id="stockchk-suggestions" hidden></div>
+        </div>
+        <div class="stockchk-selected" id="stockchk-selected" hidden>
+          <div class="stockchk-selected-info">
+            <strong id="stockchk-selected-nombre">—</strong>
+            <span id="stockchk-selected-meta">—</span>
+          </div>
+          <button type="button" class="btn btn-ghost btn-small" id="stockchk-clear">Cambiar producto</button>
+        </div>
+        <p class="hint" id="stockchk-empty-hint">Selecciona un producto para comenzar.</p>
+      </div>
+
+      <div class="modal-section" id="stockchk-filtro-section" hidden>
+        <div class="modal-section-title"><span class="dot"></span> Rango a analizar</div>
+        <div class="seg-tabs" id="stockchk-mode-tabs">
+          <button class="seg-tab active" data-mode="fecha">Por fecha</button>
+          <button class="seg-tab" data-mode="pedidos">Por rango de pedidos</button>
+        </div>
+
+        <div id="stockchk-modo-fecha">
+          <div class="resu-filtro-row">
+            <div class="seg-tabs" id="stockchk-rango-presets">
+              <button class="seg-tab" data-rango="hoy">Hoy</button>
+              <button class="seg-tab" data-rango="ayer">Ayer</button>
+              <button class="seg-tab" data-rango="7dias">Últimos 7 días</button>
+              <button class="seg-tab active" data-rango="30dias">Últimos 30 días</button>
+              <button class="seg-tab" data-rango="mes">Este mes</button>
+              <button class="seg-tab" data-rango="mesanterior">Mes anterior</button>
+            </div>
+            <div class="resu-filtro-custom">
+              <label>Desde <input type="date" id="stockchk-desde"></label>
+              <label>Hasta <input type="date" id="stockchk-hasta"></label>
+              <button class="btn btn-ghost btn-small" id="stockchk-rango-aplicar">Aplicar rango</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="stockchk-modo-pedidos" hidden>
+          <div class="resu-filtro-custom">
+            <label>Pedido desde (N.º orden) <input type="number" id="stockchk-orden-desde" min="0" step="1" placeholder="Ej. 100"></label>
+            <label>Pedido hasta (N.º orden) <input type="number" id="stockchk-orden-hasta" min="0" step="1" placeholder="Ej. 150"></label>
+            <button class="btn btn-ghost btn-small" id="stockchk-orden-aplicar">Aplicar rango</button>
+          </div>
+          <p class="hint">Se toman en cuenta los pedidos nuevos y los que ya están en seguimiento, según su número de orden.</p>
+        </div>
+      </div>
+
+      <div id="stockchk-resultados" hidden>
+        <div class="stat-grid">
+          <div class="stat-card accent">
+            <span class="stat-label">Unidades pedidas en el rango</span>
+            <span class="stat-value" id="stockchk-total-unidades">—</span>
+            <span class="stat-sub" id="stockchk-rango-label">—</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">Stock actual</span>
+            <span class="stat-value" id="stockchk-stock-actual">—</span>
+            <span class="stat-sub">unidades disponibles ahora mismo</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">Pedidos con este producto</span>
+            <span class="stat-value" id="stockchk-total-pedidos">—</span>
+            <span class="stat-sub">dentro del rango seleccionado</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">Salida diaria promedio</span>
+            <span class="stat-value" id="stockchk-salida-diaria">—</span>
+            <span class="stat-sub" id="stockchk-dias-sub">—</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">Autonomía de stock estimada</span>
+            <span class="stat-value" id="stockchk-autonomia">—</span>
+            <span class="stat-sub">al ritmo de venta de este rango</span>
+          </div>
+        </div>
+
+        <div class="panel-box">
+          <div class="panel-box-head">
+            <h2>Pedidos incluidos en el rango</h2>
+          </div>
+          <div id="stockchk-pedidos-list" class="mini-table">Cargando…</div>
+        </div>
+      </div>
+
+    </div>
+    <footer class="modal-footer">
+      <button class="btn btn-ghost" data-close="modal-stock-check">Cerrar</button>
+    </footer>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<section id="receipt-export" aria-hidden="true">
+  <header class="receipt-header">
+    <div class="receipt-header-left">
+      <h1>BUQUENQUE SHOPS</h1>
+      <p id="export-order-id"></p>
+    </div>
+    <div class="receipt-header-right">
+      <p id="export-date"></p>
+      <p>OPERADOR: INTERNO-01</p>
+    </div>
+  </header>
+  <section class="receipt-client-info">
+    <h2>DATOS DEL CLIENTE</h2>
+    <p id="export-client-name"></p>
+    <p id="export-address"></p>
+    <p id="export-delivery-method" hidden></p>
+    <p id="export-priority" hidden></p>
+    <p id="export-recipient-name"></p>
+    <p id="export-recipient-phone"></p>
+    <p id="export-buyer-phone"></p>
+  </section>
+  <table class="receipt-items">
+    <thead><tr><th>DESCRIPCIÓN</th><th>CANT</th><th>P.U.</th><th>SUB</th></tr></thead>
+    <tbody id="export-table-body"></tbody>
+  </table>
+  <section class="receipt-totals">
+    <div><span>SUBTOTAL NETO</span><span id="export-subtotal"></span></div>
+    <div><span>DESC. APLICADOS</span><span id="export-discounts"></span></div>
+    <div class="receipt-grand-total"><span>TOTAL ORDEN</span><span id="export-total"></span></div>
+  </section>
+  <footer class="receipt-footer">
+    <p>ESTE DOCUMENTO ES UNA ORDEN DE TRABAJO INTERNA PARA DESPACHO.</p>
+  </footer>
+</section>
+
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js" crossorigin="anonymous"></script>
+<script src="app.js?v=16"></script>
 </body>
 </html>
