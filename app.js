@@ -281,8 +281,11 @@ function parseCloudinaryUrl(url){
     const isCloudinary = parsed.hostname.endsWith('cloudinary.com');
     if (!isCloudinary) return null;
     const path = parsed.pathname.split('/').filter(Boolean);
+    const cloudName = parsed.hostname === 'res.cloudinary.com'
+      ? path[0]
+      : parsed.hostname.split('.')[0];
     const uploadIndex = path.indexOf('upload');
-    if (uploadIndex < 0) return null;
+    if (uploadIndex < 0 || !cloudName) return null;
     const afterUpload = path.slice(uploadIndex + 1);
     let folder = '';
     let publicId = '';
@@ -302,7 +305,7 @@ function parseCloudinaryUrl(url){
     const extension = publicId ? (publicId.split('.').pop().toUpperCase() || null) : null;
     const format = extension || (transformations.includes('f_webp') ? 'WEBP' : transformations.includes('f_png') ? 'PNG' : transformations.includes('f_jpg') ? 'JPG' : 'IMG');
     return {
-      cloudName: parsed.hostname.split('.')[0],
+      cloudName,
       folder,
       publicId,
       format,
@@ -480,15 +483,10 @@ const CLD_SIZES = {
 function setCloudinaryCloudNameFromItems(items){
   for (const item of items || []){
     for (const imageUrl of item.imagenes_url || []){
-      try{
-        const parsed = new URL(imageUrl);
-        if (parsed.hostname.endsWith('.cloudinary.com')){
-          state.cloudName = parsed.hostname.split('.')[0];
-          return;
-        }
-      }catch(e){
-        continue;
-      }
+      const cloudinaryInfo = parseCloudinaryUrl(imageUrl);
+      if (!cloudinaryInfo) continue;
+      state.cloudName = cloudinaryInfo.cloudName;
+      return;
     }
   }
 }
